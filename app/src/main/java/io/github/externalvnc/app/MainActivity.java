@@ -46,6 +46,8 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     private Button connectButton, scaleButton, captureButton;
     private TouchpadView touchpad;
     private ExternalPresentation presentation;
+    private InputTestPresentation inputTestPresentation;
+    private Button inputTestButton;
     private RfbClient currentClient;
     private boolean captured;
     private int scaleMode;
@@ -104,14 +106,41 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
             if (presentation != null) presentation.setScaleMode(scaleMode);
         });
 
-        captureButton = button(actionRow, "抓取鼠标", 1f);
+        LinearLayout inputRow = row(layout);
+        inputTestButton = button(inputRow, "键鼠测试（不连接VNC）", 1.6f);
+        inputTestButton.setOnClickListener(v -> {
+            if (inputTestPresentation != null) closeInputTest();
+            else openInputTest();
+        });
+
+        captureButton = button(inputRow, "抓取鼠标", 1f);
         captureButton.setOnClickListener(v -> toggleCapture());
 
-        TextView hint = label("单指移动/点击，双指滚动；外接键盘在触控板获得焦点时转发。"
-                + "点击抓取鼠标以使用相对移动。", 12);
+        TextView hint = label("键鼠测试：HDMI 显示虚拟光标和按键；鼠标可在下方触控板区域移动，"
+                + "点击“抓取鼠标”可尝试捕获硬件鼠标；点击触控板使硬件键盘获得焦点。", 12);
         hint.setTextColor(0xffb9c6d4);
         layout.addView(hint);
         touchpad = new TouchpadView(this);
+        touchpad.setInputListener(new TouchpadView.InputListener() {
+            @Override public void onMove(float dx, float dy) {
+                if (inputTestPresentation != null) inputTestPresentation.move(dx, dy);
+            }
+            @Override public void onClick(int button) {
+                if (inputTestPresentation != null) inputTestPresentation.click(button);
+            }
+            @Override public void onScroll(boolean up) {
+                if (inputTestPresentation != null) inputTestPresentation.scroll(up);
+            }
+        });
+        touchpad.setCaptureListener(hasCapture -> {
+            captured = hasCapture;
+            captureButton.setText(hasCapture ? "释放鼠标" : "抓取鼠标");
+            if (inputTestPresentation != null) {
+                inputTestPresentation.captured(hasCapture);
+                status(hasCapture ? "鼠标已捕获：移动鼠标，观察 HDMI 绿色虚拟光标。"
+                        : "鼠标未捕获：把鼠标移入下方触控板区域，也可验证输入。");
+            }
+        });
         touchpad.setOnCapturedPointerListener(this::handleCapturedPointer);
         LinearLayout.LayoutParams touchParams = new LinearLayout.LayoutParams(-1, 0, 1);
         touchParams.topMargin = dp(6);
@@ -193,6 +222,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         int selected = displaySelector.getSelectedItemPosition();
         if (selected < 0 || selected >= displays.size()) return false;
         Display target = displays.get(selected);
+        if (inputTestPresentation != null) closeInputTest();
         if (presentation != null
                 && presentation.getDisplay().getDisplayId() == target.getDisplayId()) return true;
         closePresentation();
@@ -208,6 +238,41 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
             status("独立外屏失败：" + error.getMessage());
             return false;
         }
+    }
+
+
+    /** Independent input pipeline test; no VNC server, host, or password required. */
+    private void openInputTest() {
+        if (displays.isEmpty()) {
+            status("没有检测到外接显示器，请先接上 HDMI。");
+            return;
+        }
+        int selected = displaySelector.getSelectedItemPosition();
+        if (selected < 0 || selected >= displays.size()) return;
+        if (currentClient != null) disconnect();
+        closePresentation();
+        closeInputTest();
+        Display target = displays.get(selected);
+        try {
+            InputTestPresentation next = new InputTestPresentation(this, target);
+            next.show();
+            inputTestPresentation = next;
+            inputTestButton.setText("退出键鼠测试");
+            status("HDMI 输入测试已开启：在触控板区域移动鼠标，或点击“抓取鼠标”。");
+            // Keep keyboard focus in the primary Activity, not on the Presentation.
+            touchpad.post(touchpad::requestFocus);
+        } catch (RuntimeException error) {
+            status("键鼠测试失败：" + error.getMessage());
+        }
+    }
+
+    private void closeInputTest() {
+        if (inputTestPresentation == null) return;
+        if (touchpad.hasPointerCapture()) touchpad.releasePointerCapture();
+        inputTestPresentation.dismiss();
+        inputTestPresentation = null;
+        inputTestButton.setText("键鼠测试（不连接VNC）");
+        status("键鼠测试已结束；可以重新启动或连接 VNC。");
     }
 
     private void connect() {
@@ -295,38 +360,52 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     }
 
     private void toggleCapture() {
-        captured = !captured;
-        if (captured) {
-            touchpad.requestFocus();
-            touchpad.requestPointerCapture();
-            captureButton.setText("释放鼠标");
-        } else {
+        if (touchpad.hasPointerCapture()) {
             touchpad.releasePointerCapture();
             pressedButtons = 0;
             if (currentClient != null) currentClient.setButtons(0);
-            captureButton.setText("抓取鼠标");
+            return;
         }
+        touchpad.requestFocus();
+        touchpad.post(() -> {
+            touchpad.requestPointerCapture();
+            touchpad.postDelayed(() -> {
+                if (!touchpad.hasPointerCapture()) {
+                    status("ColorOS 未授予鼠标捕获；仍可在下方触控板内移动鼠标测试。");
+                }
+            }, 400);
+        });
     }
 
     private boolean handleCapturedPointer(View view, MotionEvent event) {
         RfbClient session = currentClient;
-        if (session == null) return false;
+        InputTestPresentation test = inputTestPresentation;
+        if (session == null && test == null) return false;
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_MOVE:
             case MotionEvent.ACTION_HOVER_MOVE:
-                session.sendRelativeMove(event.getX() * 1.8f, event.getY() * 1.8f);
+                float dx = event.getX(), dy = event.getY();
+                if (session != null) session.sendRelativeMove(dx * 1.8f, dy * 1.8f);
+                if (test != null) test.move(dx, dy);
                 return true;
             case MotionEvent.ACTION_BUTTON_PRESS:
-                pressedButtons |= mouseButton(event.getActionButton());
-                session.setButtons(pressedButtons);
+                int downButton = mouseButton(event.getActionButton());
+                pressedButtons |= downButton;
+                if (session != null) session.setButtons(pressedButtons);
+                if (test != null) test.button(downButton, true);
                 return true;
             case MotionEvent.ACTION_BUTTON_RELEASE:
-                pressedButtons &= ~mouseButton(event.getActionButton());
-                session.setButtons(pressedButtons);
+                int upButton = mouseButton(event.getActionButton());
+                pressedButtons &= ~upButton;
+                if (session != null) session.setButtons(pressedButtons);
+                if (test != null) test.button(upButton, false);
                 return true;
             case MotionEvent.ACTION_SCROLL:
                 float wheel = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
-                if (wheel != 0) session.scroll(wheel > 0);
+                if (wheel != 0) {
+                    if (session != null) session.scroll(wheel > 0);
+                    if (test != null) test.scroll(wheel > 0);
+                }
                 return true;
             default: return false;
         }
@@ -340,6 +419,12 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     }
 
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        if (inputTestPresentation != null && getCurrentFocus() == touchpad
+                && (event.getAction() == KeyEvent.ACTION_DOWN
+                || event.getAction() == KeyEvent.ACTION_UP)) {
+            inputTestPresentation.key(event);
+            return true;
+        }
         RfbClient session = currentClient;
         if (session != null && getCurrentFocus() == touchpad) {
             int keysym = KeySyms.map(event);
@@ -361,12 +446,16 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     @Override public void onDisplayRemoved(int displayId) {
         if (presentation != null && presentation.getDisplay().getDisplayId() == displayId)
             closePresentation();
+        if (inputTestPresentation != null
+                && inputTestPresentation.getDisplay().getDisplayId() == displayId)
+            closeInputTest();
         ui.post(this::refreshDisplays);
     }
 
     @Override protected void onDestroy() {
         displayManager.unregisterDisplayListener(this);
         disconnect();
+        closeInputTest();
         closePresentation();
         worker.shutdownNow();
         super.onDestroy();

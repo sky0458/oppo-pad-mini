@@ -11,7 +11,20 @@ import io.github.externalvnc.rfb.RfbClient;
 /** A touchpad on the Android primary display, sending RFB input to the remote computer. */
 public final class TouchpadView extends View {
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    public interface InputListener {
+        void onMove(float dx, float dy);
+        void onClick(int button);
+        void onScroll(boolean up);
+    }
+    public interface CaptureListener {
+        void onChanged(boolean hasCapture);
+    }
+
     private RfbClient client;
+    private InputListener inputListener;
+    private CaptureListener captureListener;
+    private boolean hoverKnown;
+    private float hoverX, hoverY;
     private float lastX, lastY, startX, startY, wheel;
     private long downTime;
     private boolean moved;
@@ -24,6 +37,28 @@ public final class TouchpadView extends View {
     }
 
     public void setClient(RfbClient client) { this.client = client; }
+    public void setInputListener(InputListener listener) { inputListener = listener; }
+    public void setCaptureListener(CaptureListener listener) { captureListener = listener; }
+
+    @Override public void onPointerCaptureChange(boolean hasCapture) {
+        super.onPointerCaptureChange(hasCapture);
+        if (captureListener != null) captureListener.onChanged(hasCapture);
+    }
+
+    private void emitMove(float dx, float dy) {
+        if (client != null) client.sendRelativeMove(dx * 1.8f, dy * 1.8f);
+        if (inputListener != null) inputListener.onMove(dx, dy);
+    }
+
+    private void emitClick(int button) {
+        if (client != null) client.click(button);
+        if (inputListener != null) inputListener.onClick(button);
+    }
+
+    private void emitScroll(boolean up) {
+        if (client != null) client.scroll(up);
+        if (inputListener != null) inputListener.onScroll(up);
+    }
 
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
@@ -53,23 +88,24 @@ public final class TouchpadView extends View {
                 float newX = event.getX(), newY = event.getY();
                 float dx = newX - lastX, dy = newY - lastY;
                 if (Math.hypot(newX - startX, newY - startY) > 12) moved = true;
-                if (client != null) {
+                if (client != null || inputListener != null) {
                     if (event.getPointerCount() >= 2) {
                         wheel += dy;
                         while (Math.abs(wheel) >= 30) {
                             boolean up = wheel < 0;
-                            client.scroll(up);
+                            emitScroll(up);
                             wheel += up ? 30 : -30;
                         }
                     } else {
-                        client.sendRelativeMove(dx * 1.8f, dy * 1.8f);
+                        emitMove(dx, dy);
                     }
                 }
                 lastX = newX; lastY = newY;
                 return true;
             case MotionEvent.ACTION_UP:
-                if (client != null && !moved && event.getEventTime() - downTime < 300)
-                    client.click(1);
+                if ((client != null || inputListener != null) && !moved
+                        && event.getEventTime() - downTime < 300)
+                    emitClick(1);
                 getParent().requestDisallowInterceptTouchEvent(false);
                 return true;
             case MotionEvent.ACTION_CANCEL:
@@ -80,9 +116,23 @@ public final class TouchpadView extends View {
     }
 
     @Override public boolean onGenericMotionEvent(MotionEvent event) {
-        if (event.getActionMasked() == MotionEvent.ACTION_SCROLL && client != null) {
+        if (event.getActionMasked() == MotionEvent.ACTION_SCROLL) {
             float dy = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
-            if (dy != 0) { client.scroll(dy > 0); return true; }
+            if (dy != 0) { emitScroll(dy > 0); return true; }
+        }
+        if (event.getActionMasked() == MotionEvent.ACTION_HOVER_ENTER) {
+            hoverKnown = false;
+            return true;
+        }
+        if (event.getActionMasked() == MotionEvent.ACTION_HOVER_MOVE) {
+            float x = event.getX(), y = event.getY();
+            if (hoverKnown) emitMove(x - hoverX, y - hoverY);
+            hoverX = x; hoverY = y; hoverKnown = true;
+            return true;
+        }
+        if (event.getActionMasked() == MotionEvent.ACTION_HOVER_EXIT) {
+            hoverKnown = false;
+            return true;
         }
         return super.onGenericMotionEvent(event);
     }
