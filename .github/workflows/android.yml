@@ -18,12 +18,20 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      # ubuntu-latest already includes Android command line tools; avoid deprecated
-      # android-actions/setup-android@v3 which installs the removed 'tools' package.
-      - name: Install Android platform
+      - name: Install Android SDK platform
+        shell: bash
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          echo "ANDROID_HOME=${ANDROID_HOME:-unset}"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n1)"
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "sdkmanager unavailable on runner; inspected $SDK_ROOT"
+            find "$SDK_ROOT" -maxdepth 3 -type d 2>/dev/null | head -40
+            exit 1
+          fi
+          echo "Using $SDKMANAGER"
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" "platforms;android-35" "build-tools;35.0.0"
       - run: gradle --no-daemon :app:assembleDebug
       - uses: actions/upload-artifact@v4
         with:
