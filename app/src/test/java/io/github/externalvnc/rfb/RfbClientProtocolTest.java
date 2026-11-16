@@ -72,12 +72,27 @@ public class RfbClientProtocolTest {
                         out.writeInt(0); out.write(new byte[16]);
                     }
                     out.flush();
-                    assertTrue(readUpdateRequestIncremental(in));
-
-                    assertEquals(0x0d, in.readUnsignedByte());
-                    assertEquals(0, in.readUnsignedByte()); // switch one screen
-                    assertEquals(0, in.readUnsignedShort());
-                    assertEquals(202, in.readInt());
+                    // The framebuffer reader and outbound input worker are independent:
+                    // either message may win the socket write lock first.
+                    boolean gotIncremental = false, gotSelect = false;
+                    for (int message = 0; message < 2; message++) {
+                        int type = in.readUnsignedByte();
+                        if (type == 3) {
+                            assertEquals(1, in.readUnsignedByte());
+                            assertEquals(0, in.readUnsignedShort());
+                            assertEquals(0, in.readUnsignedShort());
+                            assertEquals(8, in.readUnsignedShort());
+                            assertEquals(4, in.readUnsignedShort());
+                            gotIncremental = true;
+                        } else if (type == 0x0d) {
+                            assertEquals(0, in.readUnsignedByte()); // switch one screen
+                            assertEquals(0, in.readUnsignedShort());
+                            assertEquals(202, in.readInt());
+                            gotSelect = true;
+                        } else fail("Unexpected outbound message type " + type);
+                    }
+                    assertTrue(gotIncremental);
+                    assertTrue(gotSelect);
                     displaySelected.countDown();
 
                     // Apple DisplayInfo2: new framebuffer 4x4, two monitor identities.
