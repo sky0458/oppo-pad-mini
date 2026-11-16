@@ -67,6 +67,11 @@ public final class ExternalPresentation extends Presentation {
         if (cursorView != null) cursorView.setScaleMode(mode);
     }
 
+    public void setRemoteViewport(int x, int y, int w, int h) {
+        if (frameView != null) frameView.setViewport(x, y, w, h);
+        if (cursorView != null) cursorView.setViewport(x, y, w, h);
+    }
+
     @Override public void dismiss() {
         if (frameView != null) frameView.release();
         super.dismiss();

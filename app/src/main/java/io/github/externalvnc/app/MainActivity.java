@@ -95,13 +95,17 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     private String editingProfileId, activeSessionProfileId;
     private boolean loadingProfile;
     private boolean drawerOpen;
+    private boolean keyboardVisible;
     private FrameLayout drawerOverlay;
     private ScrollView drawerPanel;
     private Button floatingMenuButton;
+    private Button floatingKeyboardButton;
+    private OnScreenKeyboardView onscreenKeyboard;
     private AppLog diagnostics;
     private TextView statusLabel;
     private Button connectButton, scaleButton, captureButton;
     private Button fpsButton;
+    private Button remoteDisplaysButton;
     private Button accessibilityButton;
     private TextView fpsStatus;
     private TouchpadView touchpad;
@@ -113,8 +117,10 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     private int scaleMode;
     private int pressedButtons;
     private int targetFps = 30;
+    private int remoteViewX, remoteViewY, remoteViewW, remoteViewH;
     private float cursorScale = 1f;
     private float mouseSpeed = 2f;
+    private float scrollSpeed = 2.5f;
     private boolean immersiveMouse = true;
     private boolean fastColor = true;
     private volatile String performanceSummary = "";
@@ -147,9 +153,11 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         fpsButton.setText("目标帧率：" + targetFps);
         cursorScale = getPreferences(MODE_PRIVATE).getFloat("cursorScale", 1f);
         mouseSpeed = getPreferences(MODE_PRIVATE).getFloat("mouseSpeed", 2f);
+        scrollSpeed = getPreferences(MODE_PRIVATE).getFloat("scrollSpeed", 2.5f);
         immersiveMouse = getPreferences(MODE_PRIVATE).getBoolean("immersiveMouse", true);
         fastColor = getPreferences(MODE_PRIVATE).getBoolean("fastColor", true);
         touchpad.setMouseSpeed(mouseSpeed);
+        touchpad.setScrollSpeed(scrollSpeed);
         captureButton.setText(immersiveMouse ? "沉浸鼠标：待抓取" : "抓取鼠标");
         VncKeyboardAccessibilityService.attach(this);
         // A new launch has no active session: expose the connection controls first.
@@ -164,6 +172,22 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         touchpad = new TouchpadView(this);
         screen.addView(touchpad, new FrameLayout.LayoutParams(-1, -1));
 
+        onscreenKeyboard = new OnScreenKeyboardView(this);
+        onscreenKeyboard.setVisibility(View.GONE);
+        screen.addView(onscreenKeyboard, new FrameLayout.LayoutParams(-1,
+                Math.max(dp(185), getResources().getDisplayMetrics().heightPixels / 2),
+                Gravity.BOTTOM));
+        screen.addOnLayoutChangeListener((v, left, top, right, bottom, oldLeft, oldTop,
+                                          oldRight, oldBottom) -> {
+            int half = Math.max(dp(185), (bottom - top) / 2);
+            FrameLayout.LayoutParams params = (FrameLayout.LayoutParams)
+                    onscreenKeyboard.getLayoutParams();
+            if (params.height != half) {
+                params.height = half;
+                onscreenKeyboard.setLayoutParams(params);
+            }
+        });
+
         floatingMenuButton = new Button(this);
         floatingMenuButton.setAllCaps(false);
         floatingMenuButton.setText("☰");
@@ -175,6 +199,19 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         fabParams.topMargin = dp(28);
         fabParams.rightMargin = dp(14);
         screen.addView(floatingMenuButton, fabParams);
+
+        floatingKeyboardButton = new Button(this);
+        floatingKeyboardButton.setAllCaps(false);
+        floatingKeyboardButton.setText("⌨");
+        floatingKeyboardButton.setTextSize(23);
+        floatingKeyboardButton.setAlpha(.66f);
+        floatingKeyboardButton.setContentDescription("打开或关闭 87 键虚拟键盘");
+        floatingKeyboardButton.setOnClickListener(v -> toggleOnscreenKeyboard());
+        FrameLayout.LayoutParams keyboardFab = new FrameLayout.LayoutParams(dp(58), dp(58),
+                Gravity.TOP | Gravity.END);
+        keyboardFab.topMargin = dp(95);
+        keyboardFab.rightMargin = dp(14);
+        screen.addView(floatingKeyboardButton, keyboardFab);
 
         // The drawer is an in-app overlay, not a SYSTEM_ALERT_WINDOW system overlay.
         drawerOverlay = new FrameLayout(this);
@@ -210,6 +247,11 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                 position.topMargin = Math.max(dp(14), safe.top + dp(10));
                 position.rightMargin = Math.max(dp(14), safe.right + dp(10));
                 floatingMenuButton.setLayoutParams(position);
+                FrameLayout.LayoutParams keyboardPosition = (FrameLayout.LayoutParams)
+                        floatingKeyboardButton.getLayoutParams();
+                keyboardPosition.topMargin = position.topMargin + dp(66);
+                keyboardPosition.rightMargin = position.rightMargin;
+                floatingKeyboardButton.setLayoutParams(keyboardPosition);
                 return insets;
             });
         }
@@ -310,6 +352,8 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         });
 
         LinearLayout performanceRow = row(layout);
+        remoteDisplaysButton = button(performanceRow, "远端显示器", 1.1f);
+        remoteDisplaysButton.setOnClickListener(v -> showRemoteDisplays());
         Button resolutionButton = button(performanceRow, "远端分辨率", 1.2f);
         resolutionButton.setOnClickListener(v -> showResolutionOptions());
         fpsButton = button(performanceRow, "目标帧率：30", 1.1f);
@@ -411,8 +455,113 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                 .setNegativeButton("取消", null).show();
     }
 
+    private void showRemoteDisplays() {
+        RfbClient client = currentClient;
+        if (client == null) { status("请先连接 VNC，再选择 Mac 的显示器。"); return; }
+        List<RfbClient.RemoteDisplay> remote = client.getRemoteDisplays();
+        boolean appleSwitch = client.supportsDisplaySwitch();
+        List<String> choices = new ArrayList<>();
+        choices.add("完整远端桌面 / 所有显示器");
+        for (int n = 0; n < remote.size(); n++) {
+            RfbClient.RemoteDisplay display = remote.get(n);
+            choices.add("显示器 " + (n + 1) + (display.primary ? "（主屏）" : "")
+                    + " · " + display.width + "×" + display.height
+                    + (appleSwitch ? " · 服务端切换" : " · 本地裁切"));
+        }
+        choices.add("手动区域（X、Y、宽、高）…");
+        choices.add("左右双屏：左半幅");
+        choices.add("左右双屏：右半幅");
+        new AlertDialog.Builder(this)
+                .setTitle("Mac 远端显示器")
+                .setItems(choices.toArray(new String[0]), (dialog, selected) -> {
+                    if (selected == 0) {
+                        applyRemoteViewport(0, 0, 0, 0);
+                        if (appleSwitch) client.selectAppleDisplay(null);
+                        client.requestFullRefresh();
+                        status("显示完整远端桌面。" );
+                    } else if (selected <= remote.size()) {
+                        RfbClient.RemoteDisplay d = remote.get(selected - 1);
+                        if (appleSwitch) {
+                            applyRemoteViewport(0, 0, 0, 0);
+                            if (!client.selectAppleDisplay(d.id))
+                                status("Mac 不接受显示器切换请求，请查看日志。");
+                            else {
+                                client.requestFullRefresh();
+                                status("已请求切换到 Mac 显示器 " + selected + "，等待服务器更新。" );
+                            }
+                        } else {
+                            applyRemoteViewport(d.x, d.y, d.width, d.height);
+                            status("已裁切远端显示器 " + selected
+                                    + "；服务端未提供主动切换接口。" );
+                        }
+                    } else if (selected == remote.size() + 1) showCustomRemoteViewport();
+                    else {
+                        int w = client.getFramebufferWidth(), h = client.getFramebufferHeight();
+                        if (w <= 1 || h <= 0) { status("远端尺寸尚不可用。" ); return; }
+                        int half = w / 2;
+                        boolean right = selected == remote.size() + 3;
+                        applyRemoteViewport(right ? half : 0, 0,
+                                right ? w - half : half, h);
+                        status("已按左右两半裁切；仅适用于远端正在输出组合画面的情况。" );
+                    }
+                })
+                .setNeutralButton("能力说明", (dialog, which) -> new AlertDialog.Builder(this)
+                        .setTitle("为什么可能看不到第二屏？")
+                        .setMessage("优先使用 Apple DisplayInfo / SetDisplay 扩展让 Mac 切换真实显示器；"
+                                + "其他 VNC 服务端如果报告了 ExtendedDesktopSize 多屏布局，"
+                                + "则在接收到的组合桌面里裁切显示。\n\n"
+                                + "若 Mac 只传送单个显示器的画面、也不返回任何显示器列表，"
+                                + "普通 VNC 客户端无法凭空获取另一块屏幕。"
+                                + "手动区域与左右半幅仅用于服务器已经发送组合桌面的情况。")
+                        .setPositiveButton("知道了", null).show())
+                .setNegativeButton("取消", null).show();
+    }
+
+    private void showCustomRemoteViewport() {
+        RfbClient client = currentClient;
+        if (client == null) return;
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(16), dp(8), dp(16), dp(8));
+        String[] placeholders = {"X（左上角）", "Y（左上角）", "宽度", "高度"};
+        String[] current = {"0", "0", Integer.toString(client.getFramebufferWidth()),
+                Integer.toString(client.getFramebufferHeight())};
+        EditText[] fields = new EditText[4];
+        for (int i = 0; i < fields.length; i++) {
+            fields[i] = new EditText(this);
+            fields[i].setInputType(InputType.TYPE_CLASS_NUMBER);
+            fields[i].setHint(placeholders[i]);
+            fields[i].setText(current[i]);
+            box.addView(fields[i]);
+        }
+        new AlertDialog.Builder(this).setTitle("本地画面区域裁切")
+                .setView(box).setPositiveButton("显示此区域", (dialog, which) -> {
+                    try {
+                        int x = Integer.parseInt(fields[0].getText().toString());
+                        int y = Integer.parseInt(fields[1].getText().toString());
+                        int w = Integer.parseInt(fields[2].getText().toString());
+                        int h = Integer.parseInt(fields[3].getText().toString());
+                        if (x < 0 || y < 0 || w < 64 || h < 64
+                                || (long) x + w > client.getFramebufferWidth()
+                                || (long) y + h > client.getFramebufferHeight())
+                            throw new NumberFormatException();
+                        applyRemoteViewport(x, y, w, h);
+                        status("已显示远端区域 (" + x + "," + y + ") " + w + "×" + h);
+                    } catch (NumberFormatException error) {
+                        status("区域无效：请输入远端帧缓冲内的 X、Y、宽度、高度。");
+                    }
+                }).setNegativeButton("取消", null).show();
+    }
+
+    private void applyRemoteViewport(int x, int y, int w, int h) {
+        remoteViewX = x; remoteViewY = y; remoteViewW = w; remoteViewH = h;
+        if (presentation != null) presentation.setRemoteViewport(x, y, w, h);
+        if (currentClient != null) currentClient.setPointerViewport(x, y, w, h);
+    }
+
     private void showMouseSettings() {
         final float originalSpeed = mouseSpeed, originalCursor = cursorScale;
+        final float originalScroll = scrollSpeed;
         final boolean originalImmersive = immersiveMouse, originalColor = fastColor;
         LinearLayout column = new LinearLayout(this);
         column.setOrientation(LinearLayout.VERTICAL);
@@ -433,6 +582,23 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
             @Override public void onStopTrackingTouch(SeekBar bar) { }
         });
         column.addView(speedBar);
+
+        TextView scrollLabel = label("滚动倍率：" + Math.round(scrollSpeed * 100)
+                + "%（双指/实体滚轮）", 15);
+        column.addView(scrollLabel);
+        SeekBar scrollBar = new SeekBar(this);
+        scrollBar.setMax(450); // 50%–500%
+        scrollBar.setProgress(Math.round(scrollSpeed * 100) - 50);
+        scrollBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar bar, int progress, boolean user) {
+                scrollSpeed = (progress + 50) / 100f;
+                scrollLabel.setText("滚动倍率：" + (progress + 50) + "%（双指/实体滚轮）");
+                if (touchpad != null) touchpad.setScrollSpeed(scrollSpeed);
+            }
+            @Override public void onStartTrackingTouch(SeekBar bar) { }
+            @Override public void onStopTrackingTouch(SeekBar bar) { }
+        });
+        column.addView(scrollBar);
 
         TextView cursorLabel = label("Mac 光标大小：" + Math.round(cursorScale * 100) + "%", 15);
         column.addView(cursorLabel);
@@ -466,6 +632,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                 .setView(column).setPositiveButton("保存", (dialog, which) -> {
                     getPreferences(MODE_PRIVATE).edit()
                             .putFloat("mouseSpeed", mouseSpeed)
+                            .putFloat("scrollSpeed", scrollSpeed)
                             .putFloat("cursorScale", cursorScale)
                             .putBoolean("immersiveMouse", immersiveMouse)
                             .putBoolean("fastColor", fastColor).apply();
@@ -476,10 +643,12 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                         status("鼠标设置已保存；传输画质在下次连接 VNC 时生效。");
                 }).setNegativeButton("取消", (dialog, which) -> {
                     mouseSpeed = originalSpeed;
+                    scrollSpeed = originalScroll;
                     cursorScale = originalCursor;
                     immersiveMouse = originalImmersive;
                     fastColor = originalColor;
                     if (touchpad != null) touchpad.setMouseSpeed(mouseSpeed);
+                    if (touchpad != null) touchpad.setScrollSpeed(scrollSpeed);
                     if (presentation != null) presentation.setCursorScale(cursorScale);
                 }).show();
     }
@@ -500,11 +669,12 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     }
 
     private void requestImmersiveCapture() {
-        if (!immersiveMouse || drawerOpen || currentClient == null
+        if (!immersiveMouse || drawerOpen || keyboardVisible || currentClient == null
                 || touchpad == null || !hasWindowFocus()) return;
         touchpad.requestFocus();
         touchpad.postDelayed(() -> {
-            if (immersiveMouse && !drawerOpen && currentClient != null && hasWindowFocus()
+            if (immersiveMouse && !drawerOpen && !keyboardVisible
+                    && currentClient != null && hasWindowFocus()
                     && !touchpad.hasPointerCapture()) {
                 touchpad.requestPointerCapture();
                 diagnostics.add("INPUT", "Automatic immersive pointer capture requested");
@@ -533,6 +703,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
 
     @Override protected void onPause() {
         if (touchpad != null && touchpad.hasPointerCapture()) touchpad.releasePointerCapture();
+        if (onscreenKeyboard != null) onscreenKeyboard.releaseModifiers();
         if (currentClient != null) currentClient.releaseAllKeys();
         super.onPause();
     }
@@ -563,7 +734,10 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     }
 
     @Override public void onBackPressed() {
-        if (drawerOpen) closeDrawer();
+        if (keyboardVisible) {
+            hideOnscreenKeyboard();
+            requestImmersiveCapture();
+        } else if (drawerOpen) closeDrawer();
         else openDrawer();
     }
 
@@ -628,6 +802,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     private void openDrawer() {
         if (drawerOpen) return;
         drawerOpen = true;
+        hideOnscreenKeyboard();
         if (touchpad != null && touchpad.hasPointerCapture()) touchpad.releasePointerCapture();
         if (currentClient != null) {
             currentClient.setButtons(0);
@@ -656,6 +831,33 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         if (keyboard != null) keyboard.hideSoftInputFromWindow(touchpad.getWindowToken(), 0);
         if (touchpad != null) touchpad.requestFocus();
         requestImmersiveCapture();
+    }
+
+    private void toggleOnscreenKeyboard() {
+        if (keyboardVisible) {
+            hideOnscreenKeyboard();
+            requestImmersiveCapture();
+            return;
+        }
+        if (currentClient == null) {
+            Toast.makeText(this, "请先连接 VNC 再使用远端 87 键键盘", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        keyboardVisible = true;
+        if (drawerOpen) closeDrawer();
+        if (touchpad != null && touchpad.hasPointerCapture()) touchpad.releasePointerCapture();
+        onscreenKeyboard.setVisibility(View.VISIBLE);
+        floatingKeyboardButton.setText("⌨ ✕");
+        diagnostics.add("INPUT", "87-key onscreen keyboard opened");
+    }
+
+    private void hideOnscreenKeyboard() {
+        if (!keyboardVisible) return;
+        keyboardVisible = false;
+        onscreenKeyboard.releaseModifiers();
+        onscreenKeyboard.setVisibility(View.GONE);
+        floatingKeyboardButton.setText("⌨");
+        diagnostics.add("INPUT", "87-key onscreen keyboard closed");
     }
 
     private void refreshProfiles(String selectedId) {
@@ -929,6 +1131,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
             next.setDiagnosticListener(message -> diagnostics.add("RENDER", message));
             next.setScaleMode(scaleMode);
             next.setCursorScale(cursorScale);
+            next.setRemoteViewport(remoteViewX, remoteViewY, remoteViewW, remoteViewH);
             next.showMessage("Presentation OK · Display #" + target.getDisplayId());
             presentation = next;
             status("已创建外屏窗口；请检查 HDMI 显示器是否出现 Presentation OK。");
@@ -1034,6 +1237,16 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                 });
             }
 
+            @Override public void onRemoteDisplaysChanged(
+                    List<RfbClient.RemoteDisplay> screens, boolean serverSwitch) {
+                ui.post(() -> {
+                    if (currentClient != holder[0]) return;
+                    remoteDisplaysButton.setText("远端屏幕：" + screens.size());
+                    diagnostics.add("DISPLAY", "Remote screens=" + screens.size()
+                            + " serverSwitch=" + serverSwitch);
+                });
+            }
+
             @Override public void onFrame(int width, int height, int[] pixels) {
                 // Compatibility fallback. MainActivity normally uses dirty regions instead.
                 recordFrame(width, height, pixels);
@@ -1122,6 +1335,9 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                     currentClient = null;
                     activeSessionProfileId = null;
                     touchpad.setClient(null);
+                    onscreenKeyboard.setClient(null);
+                    hideOnscreenKeyboard();
+                    remoteDisplaysButton.setText("远端显示器");
                     fpsStatus.setText("实际：-- FPS");
                     connectButton.setText("连接 VNC");
                 });
@@ -1134,11 +1350,14 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
 
         holder[0] = session;
         currentClient = session;
+        applyRemoteViewport(0, 0, 0, 0);
         activeSessionProfileId = profile.id;
         session.setTargetFps(targetFps);
         session.setFastColor(fastColor);
         touchpad.setClient(session);
+        onscreenKeyboard.setClient(session);
         touchpad.setMouseSpeed(mouseSpeed);
+        touchpad.setScrollSpeed(scrollSpeed);
         connectButton.setText("断开 VNC");
         status("正在连接 " + host + ":" + port + " ...");
         closeDrawer();
@@ -1190,8 +1409,11 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         RfbClient session = currentClient;
         currentClient = null;
         activeSessionProfileId = null;
+        hideOnscreenKeyboard();
+        onscreenKeyboard.setClient(null);
         if (session != null) session.close();
         touchpad.setClient(null);
+        remoteDisplaysButton.setText("远端显示器");
         synchronized (renderLock) { renderUpdates.clear(); }
         fpsStatus.setText("实际：-- FPS");
         if (touchpad.hasPointerCapture()) touchpad.releasePointerCapture();
@@ -1243,7 +1465,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                     dy = event.getY();
                 }
                 if (session != null) {
-                    float ratio = session.getFramebufferWidth()
+                    float ratio = session.getInteractionWidth()
                             / (float) Math.max(1, getResources().getDisplayMetrics().widthPixels);
                     float effective = Math.max(1f, ratio) * mouseSpeed;
                     session.sendRelativeMove(dx * effective, dy * effective);
@@ -1265,8 +1487,9 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
             case MotionEvent.ACTION_SCROLL:
                 float wheel = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
                 if (wheel != 0) {
-                    if (session != null) session.scroll(wheel > 0);
-                    if (test != null) test.scroll(wheel > 0);
+                    int steps = Math.max(1, Math.min(8, Math.round(Math.abs(wheel) * scrollSpeed)));
+                    if (session != null) session.scrollSteps(wheel > 0, steps);
+                    if (test != null) for (int n = 0; n < steps; n++) test.scroll(wheel > 0);
                 }
                 return true;
             default: return false;

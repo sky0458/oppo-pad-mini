@@ -44,6 +44,8 @@ public final class RfbClient implements AutoCloseable {
         /** Called locally before sending the mouse packet, so the cursor remains responsive. */
         default void onPointerMoved(int x, int y, int width, int height) { }
         default void onResizeCapabilityChanged(boolean supported) { }
+        /** Called whenever a server reports physical/virtual remote display geometry. */
+        default void onRemoteDisplaysChanged(List<RemoteDisplay> screens, boolean canSwitch) { }
         /** Network wait and framebuffer read/decode time, in milliseconds. */
         default void onFrameTiming(long serverWaitMs, long readDecodeMs, int updateRects) { }
         void onError(String error);
@@ -61,6 +63,21 @@ public final class RfbClient implements AutoCloseable {
             this.width = width;
             this.height = height;
             this.argb = argb;
+        }
+    }
+
+    public static final class RemoteDisplay {
+        public final long id;
+        public final int x, y, width, height;
+        public final boolean primary;
+
+        public RemoteDisplay(long id, int x, int y, int width, int height, boolean primary) {
+            this.id = id;
+            this.x = x;
+            this.y = y;
+            this.width = width;
+            this.height = height;
+            this.primary = primary;
         }
     }
 
@@ -84,10 +101,15 @@ public final class RfbClient implements AutoCloseable {
     private volatile Socket socket;
     private volatile DataOutputStream output;
     private volatile int width, height, cursorX, cursorY;
+    private volatile int pointerViewX, pointerViewY, pointerViewW, pointerViewH;
     private float motionRemainderX, motionRemainderY;
     private volatile int targetFps = 30;
     private volatile boolean fastColor = true;
     private volatile boolean extendedDesktopSize;
+    private volatile boolean appleServer;
+    private volatile boolean appleDisplayInfo2Seen;
+    private volatile boolean appleDisplayList;
+    private volatile List<RemoteDisplay> remoteDisplays = java.util.Collections.emptyList();
     private volatile int primaryScreenId;
     private volatile int buttonMask;
     private int[] pixels;
@@ -149,6 +171,26 @@ public final class RfbClient implements AutoCloseable {
                         if (len < 0 || len > 1048576) throw new IOException("Invalid clipboard length");
                         skip(in, len);
                         break;
+                    case 4: // Apple ServerAck (no payload)
+                    case 7: // Apple NOP (no payload)
+                        if (!appleServer) throw new IOException("Unsupported RFB message " + kind);
+                        break;
+                    case 0x51: // Apple DisplayInfo2 server message
+                        if (!appleServer) throw new IOException("Unexpected Apple display message");
+                        readAppleDisplayInfo2(in);
+                        requestUpdate(false);
+                        break;
+                    case 0x14: // Apple StateChange: [pad][payloadSize:u16][flags:u16][status:u16]...
+                        if (!appleServer) throw new IOException("Unexpected Apple state message");
+                        in.readUnsignedByte();
+                        int size = in.readUnsignedShort();
+                        if (size > 4096) throw new IOException("Invalid Apple state length");
+                        if (size >= 4) {
+                            int flags = in.readUnsignedShort(), state = in.readUnsignedShort();
+                            skip(in, size - 4);
+                            listener.onDiagnostic("Apple session state=" + state + " flags=" + flags);
+                        } else skip(in, size);
+                        break;
                     default: throw new IOException("Unsupported RFB message " + kind);
                 }
             }
@@ -171,6 +213,7 @@ public final class RfbClient implements AutoCloseable {
         if (!protocol.startsWith("RFB 003.") || greeting[11] != '\n')
             throw new IOException("Unexpected RFB greeting: " + protocol);
         int remoteMinor = Integer.parseInt(protocol.substring(8, 11));
+        appleServer = remoteMinor == 889;
         int minor = remoteMinor >= 8 ? 8 : remoteMinor >= 7 ? 7 : 3;
         listener.onDiagnostic("RFB greeting=" + protocol.trim() + " negotiated=3." + minor);
         write(String.format(java.util.Locale.ROOT, "RFB 003.%03d\n", minor)
@@ -286,9 +329,13 @@ public final class RfbClient implements AutoCloseable {
     private void setEncodings() throws IOException {
         synchronized (writeLock) {
             // macOS supports zlib (6). Prefer compressed rectangles to uncompressed Raw.
-            output.writeByte(2); output.writeByte(0); output.writeShort(5);
+            output.writeByte(2); output.writeByte(0); output.writeShort(appleServer ? 7 : 5);
             output.writeInt(6); output.writeInt(1); output.writeInt(0); output.writeInt(-223);
             output.writeInt(-308); // ExtendedDesktopSize: server must advertise before client resizes.
+            if (appleServer) {
+                output.writeInt(1101); // Apple DisplayInfo: monitor IDs and sizes.
+                output.writeInt(1105); // Apple DisplayInfo2: layout and framebuffer positions.
+            }
             output.flush();
         }
     }
@@ -319,15 +366,66 @@ public final class RfbClient implements AutoCloseable {
     public int getTargetFps() { return targetFps; }
     public int getFramebufferWidth() { return width; }
     public int getFramebufferHeight() { return height; }
+    public int getInteractionWidth() { return pointerViewW > 0 ? pointerViewW : width; }
+    public int getInteractionHeight() { return pointerViewH > 0 ? pointerViewH : height; }
+
+    /** Limit pointer activity to the locally selected rectangle of a combined framebuffer. */
+    public void setPointerViewport(int x, int y, int w, int h) {
+        pointerViewX = Math.max(0, x);
+        pointerViewY = Math.max(0, y);
+        pointerViewW = w > 0 && h > 0 ? w : 0;
+        pointerViewH = w > 0 && h > 0 ? h : 0;
+        int adjustedX = clampPointerX(cursorX), adjustedY = clampPointerY(cursorY);
+        if (adjustedX != cursorX || adjustedY != cursorY)
+            sendPointer(adjustedX, adjustedY, buttonMask);
+    }
+
+    private int clampPointerX(int x) {
+        int min = pointerViewW > 0 ? Math.min(width - 1, pointerViewX) : 0;
+        int max = pointerViewW > 0 ? Math.min(width - 1,
+                (long) pointerViewX + pointerViewW - 1 > Integer.MAX_VALUE
+                        ? width - 1 : pointerViewX + pointerViewW - 1) : width - 1;
+        return Math.max(min, Math.min(max, x));
+    }
+
+    private int clampPointerY(int y) {
+        int min = pointerViewH > 0 ? Math.min(height - 1, pointerViewY) : 0;
+        int max = pointerViewH > 0 ? Math.min(height - 1,
+                (long) pointerViewY + pointerViewH - 1 > Integer.MAX_VALUE
+                        ? height - 1 : pointerViewY + pointerViewH - 1) : height - 1;
+        return Math.max(min, Math.min(max, y));
+    }
 
     public boolean supportsRemoteResize() { return extendedDesktopSize; }
+    public boolean supportsDisplaySwitch() { return appleDisplayList; }
+    public List<RemoteDisplay> getRemoteDisplays() { return remoteDisplays; }
+
+    /** Apple Screen Sharing's SetDisplay message; null requests all displays combined. */
+    public boolean selectAppleDisplay(Long id) {
+        if (!appleDisplayList || !appleServer) return false;
+        if (id != null) {
+            boolean found = false;
+            for (RemoteDisplay display : remoteDisplays) if (display.id == id) found = true;
+            if (!found) return false;
+        }
+        return enqueueOutbound(() -> {
+            synchronized (writeLock) {
+                output.writeByte(0x0d);
+                output.writeByte(id == null ? 1 : 0);
+                output.writeShort(0);
+                output.writeInt(id == null ? 0 : (int) (long) id);
+                output.flush();
+            }
+            listener.onDiagnostic("Apple SetDisplay " + (id == null ? "all" : Long.toString(id)));
+        });
+    }
 
     /** This changes the Mac desktop only if its VNC server advertised RFB ExtendedDesktopSize. */
     public boolean requestDesktopResize(int requestedWidth, int requestedHeight) {
         if (requestedWidth < 1 || requestedHeight < 1
                 || (long) requestedWidth * requestedHeight > MAX_PIXELS
                 || requestedWidth > 65535 || requestedHeight > 65535
-                || !extendedDesktopSize) return false;
+                || !extendedDesktopSize || remoteDisplays.size() > 1) return false;
         return enqueueOutbound(() -> {
             synchronized (writeLock) {
                 output.writeByte(251); // SetDesktopSize
@@ -361,6 +459,80 @@ public final class RfbClient implements AutoCloseable {
         pixels = new int[w * h];
         cursorX = w / 2; cursorY = h / 2;
         listener.onPointerMoved(cursorX, cursorY, w, h);
+    }
+
+    private static boolean equalDisplays(List<RemoteDisplay> old, List<RemoteDisplay> next) {
+        if (old.size() != next.size()) return false;
+        for (int i = 0; i < old.size(); i++) {
+            RemoteDisplay a = old.get(i), b = next.get(i);
+            if (a.id != b.id || a.x != b.x || a.y != b.y || a.width != b.width
+                    || a.height != b.height || a.primary != b.primary) return false;
+        }
+        return true;
+    }
+
+    private void publishDisplays(List<RemoteDisplay> displays, boolean apple) {
+        if (displays.isEmpty()) return;
+        if (!apple && appleDisplayList) return; // Apple metadata has more useful IDs.
+        if (equalDisplays(remoteDisplays, displays) && appleDisplayList == apple) return;
+        remoteDisplays = java.util.Collections.unmodifiableList(new ArrayList<>(displays));
+        appleDisplayList = apple;
+        listener.onDiagnostic("Remote display layout: " + displays.size()
+                + " screen(s), Apple switching=" + apple);
+        listener.onRemoteDisplaysChanged(remoteDisplays, apple);
+    }
+
+    /** Apple's optional DisplayInfo pseudo-rectangle (1101), independent of ExtendedDesktopSize. */
+    private boolean readAppleDisplayInfo(DataInputStream in) throws IOException {
+        int fbWidth = in.readUnsignedShort(), fbHeight = in.readUnsignedShort();
+        int count = in.readUnsignedShort();
+        in.readUnsignedShort(); // flags
+        if (count > 16) throw new IOException("Invalid Apple display count " + count);
+        List<RemoteDisplay> screens = new ArrayList<>();
+        for (int n = 0; n < count; n++) {
+            long id = in.readInt() & 0xffffffffL;
+            int w = in.readUnsignedShort(), h = in.readUnsignedShort();
+            skip(in, 20); // magic (4) and pixel format (16)
+            if (w > 0 && h > 0) screens.add(new RemoteDisplay(id, 0, 0, w, h, n == 0));
+        }
+        if (!appleDisplayInfo2Seen) publishDisplays(screens, true);
+        if (fbWidth > 0 && fbHeight > 0 && (fbWidth != width || fbHeight != height)) {
+            resize(fbWidth, fbHeight);
+            return true;
+        }
+        return false;
+    }
+
+    /** Apple DisplayInfo2 (1105 rectangle / 0x51 message): size-prefixed payload. */
+    private boolean readAppleDisplayInfo2(DataInputStream in) throws IOException {
+        int size = in.readUnsignedShort();
+        if (size < 20 || size > 4096) throw new IOException("Invalid Apple display info length=" + size);
+        byte[] data = new byte[size];
+        in.readFully(data);
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(data)
+                .order(java.nio.ByteOrder.BIG_ENDIAN);
+        int fbWidth = buf.getShort(6) & 0xffff, fbHeight = buf.getShort(8) & 0xffff;
+        int count = buf.getShort(18) & 0xffff;
+        if (count > 16 || size < 20 + count * 56)
+            throw new IOException("Invalid Apple display info layout=" + count);
+        List<RemoteDisplay> screens = new ArrayList<>();
+        for (int n = 0; n < count; n++) {
+            int at = 20 + n * 56;
+            long id = buf.getInt(at + 16) & 0xffffffffL;
+            int top = buf.getShort(at + 28), left = buf.getShort(at + 30);
+            int bottom = buf.getShort(at + 32), right = buf.getShort(at + 34);
+            boolean primary = (buf.getInt(at + 36) & 1) != 0;
+            if (right > left && bottom > top)
+                screens.add(new RemoteDisplay(id, left, top,
+                        right - left, bottom - top, primary));
+        }
+        appleDisplayInfo2Seen = true;
+        publishDisplays(screens, true);
+        if (fbWidth > 0 && fbHeight > 0 && (fbWidth != width || fbHeight != height)) {
+            resize(fbWidth, fbHeight);
+            return true;
+        }
+        return false;
     }
 
     private FrameRegion snapshotRegion(int x, int y, int w, int h) {
@@ -451,11 +623,18 @@ public final class RfbClient implements AutoCloseable {
                 skip(in, 3);
                 if (screens > 16 || (screens == 0 && y == 0))
                     throw new IOException("Invalid remote screen count");
+                List<RemoteDisplay> screenLayout = new ArrayList<>();
                 for (int screen = 0; screen < screens; screen++) {
                     int id = in.readInt();
-                    skip(in, 12); // x/y/width/height/flags
+                    int sx = in.readUnsignedShort(), sy = in.readUnsignedShort();
+                    int sw = in.readUnsignedShort(), sh = in.readUnsignedShort();
+                    int flags = in.readInt();
                     if (screen == 0) primaryScreenId = id;
+                    if (sw > 0 && sh > 0)
+                        screenLayout.add(new RemoteDisplay(id & 0xffffffffL,
+                                sx, sy, sw, sh, screen == 0 || (flags & 1) != 0));
                 }
+                publishDisplays(screenLayout, false);
                 if (!extendedDesktopSize) {
                     extendedDesktopSize = true;
                     listener.onResizeCapabilityChanged(true);
@@ -466,6 +645,14 @@ public final class RfbClient implements AutoCloseable {
                     resize(w, h);
                     resizeRects++;
                 }
+                continue;
+            }
+            if (appleServer && encoding == 1101) {
+                if (readAppleDisplayInfo(in)) resizeRects++;
+                continue;
+            }
+            if (appleServer && encoding == 1105) {
+                if (readAppleDisplayInfo2(in)) resizeRects++;
                 continue;
             }
             if (w == 0 || h == 0 || x + w > width || y + h > height)
@@ -586,8 +773,8 @@ public final class RfbClient implements AutoCloseable {
 
     public void sendPointer(int x, int y, int buttons) {
         if (!ready.get() || width == 0 || height == 0) return;
-        cursorX = Math.max(0, Math.min(width - 1, x));
-        cursorY = Math.max(0, Math.min(height - 1, y));
+        cursorX = clampPointerX(x);
+        cursorY = clampPointerY(y);
         final int atX = cursorX, atY = cursorY;
         listener.onPointerMoved(atX, atY, width, height);
         enqueueOutbound(() -> writePointer(atX, atY, buttons));
@@ -606,8 +793,8 @@ public final class RfbClient implements AutoCloseable {
         motionRemainderX = accumulatedX - wholeX;
         motionRemainderY = accumulatedY - wholeY;
         if (wholeX == 0 && wholeY == 0) return;
-        cursorX = Math.max(0, Math.min(width - 1, cursorX + wholeX));
-        cursorY = Math.max(0, Math.min(height - 1, cursorY + wholeY));
+        cursorX = clampPointerX(cursorX + wholeX);
+        cursorY = clampPointerY(cursorY + wholeY);
         listener.onPointerMoved(cursorX, cursorY, width, height);
         scheduleLatestMotion();
     }
@@ -634,7 +821,25 @@ public final class RfbClient implements AutoCloseable {
         });
     }
 
-    public void scroll(boolean up) { click(up ? 8 : 16); }
+    public void scroll(boolean up) { scrollSteps(up, 1); }
+
+    /** Send a wheel burst as one outbound task to keep high-speed scrolling responsive. */
+    public void scrollSteps(boolean up, int count) {
+        final int steps = Math.max(1, Math.min(8, count));
+        final int atX = cursorX, atY = cursorY, previous = buttonMask;
+        enqueueOutbound(() -> {
+            synchronized (writeLock) {
+                if (!ready.get() || output == null) return;
+                for (int i = 0; i < steps; i++) {
+                    output.writeByte(5); output.writeByte(previous | (up ? 8 : 16));
+                    output.writeShort(atX); output.writeShort(atY);
+                    output.writeByte(5); output.writeByte(previous);
+                    output.writeShort(atX); output.writeShort(atY);
+                }
+                output.flush();
+            }
+        });
+    }
 
     public void sendKey(int keysym, boolean pressed) {
         if (keysym == 0) return;

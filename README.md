@@ -104,6 +104,16 @@ Android 平板外接 HDMI 显示器时，使用 Android Presentation API 在**�
 
 为避免意外，修改账号或切换账号均需保存；已连接期间选择其他账号会确认断开当前会话。无障碍键盘转发只在 VNC 已连接、抽屉关闭且触控板获得焦点时运行，不会转发菜单内密码输入。
 
+## v0.8.0：远端多显示器、滚动提速与 87 键虚拟键盘
+
+- **远端屏幕选择**：连接后打开右侧抽屉，点击「远端显示器」。Apple Screen Sharing (`RFB 003.889`) 客户端会请求 `DisplayInfo(1101)`、`DisplayInfo2(1105)`，当 Mac 返回物理显示器列表时，点击显示器会通过 `SetDisplay(0x0d)` 请求 Mac 切换实际输出；可选「完整桌面」。普通 VNC 服务器的 `ExtendedDesktopSize(-308)` 多屏布局也会显示为屏幕列表，但只能在客户端裁切收到的组合 framebuffer，无法强迫服务端切屏。
+- **兼容性回退**：可手动填写 X、Y、宽、高裁切，或选择「左右双屏」半幅。如果服务器仅提供单屏画面且不支持 Apple 扩展，另一屏的像素并未发送，客户端无法仅靠本地裁切获取。Apple 私有扩展属于兼容性尝试，**必须在 Mac mini 双显示器上实机确认**。
+- **滚轮提速**：双指滚动从原来的每约 30 像素一个刻度调整为可变阈值，默认 250% 倍率；实体滚轮也按倍率发送多个 VNC 滚轮刻度。通过「鼠标/画质」设置的滚动速度滑块支持 50%–500%，同时保留双指轻点右键识别。多个滚轮刻度合并进入单一网络发送任务。
+- **87 键十键无数字区键盘**：Pad 右上角菜单按钮下方新增半透明 `⌨` 浮动按钮。VNC 已连接时点击，可在 Pad **下半屏覆盖显示**完整 ANSI 87 键布局，包含 Esc、F1–F12、主键区、编辑/导航区、方向键以及 Ctrl、Shift、Command、Option 等；上半屏仍是触控板。按键直接映射 RFB keysym，不会打开 Android 系统输入法；修饰键采用点按锁存、输入一个普通键后自动释放的交互。再次点击浮动按钮或返回键收起。
+- **安全焦点切换**：展开键盘期间暂时释放实体鼠标捕获，收起后根据沉浸鼠标设置重新申请；打开连接菜单时关闭虚拟键盘并释放锁存的修饰键。键盘不读取或保存按键内容。
+
+远端多显示器能力并非所有 VNC 服务端都提供；尤其 macOS 私有扩展在不同 macOS 版本上可能有差异。请将实际连接日志（去敏后）用于继续定位。
+
 ## 技术结构
 
 - Android Java 17 / Gradle / minSdk 26
@@ -117,6 +127,8 @@ Android 平板外接 HDMI 显示器时，使用 Android Presentation API 在**�
 - 本地日志自动保存（大小上限、轮转），查看、复制、导出 `.log` 文件
 - zlib、Raw、CopyRect、DesktopSize、ExtendedDesktopSize 编码（后者需服务端支持）
 - HDMI 独立虚拟鼠标光标，局部帧更新，目标帧率 30/60/90 FPS 与实测 FPS
+- 远端显示器列表：Apple DisplayInfo / SetDisplay 优先、ExtendedDesktopSize 裁切及手动裁切回退
+- 87 键全布局浮动键盘、可调双指/滚轮速度（50%–500%）
 - 16 位省流 / 32 位原彩切换、性能耗时诊断、Mac 样式光标大小与鼠标速度调节
 - 自动沉浸式鼠标捕获、可选无障碍实体键盘快捷键映射
 - 预设/自定义分辨率请求（服务端可选支持）
@@ -140,6 +152,7 @@ Android 平板外接 HDMI 显示器时，使用 Android Presentation API 在**�
 - [AVNC](https://github.com/gujjwal00/avnc)（成熟客户端，可作为后续 LibVNCClient/TLS 接入参考）
 - [DroidVM](https://github.com/Droid-VM/DroidVM)（开源项目中已存在 VNC + Presentation 多屏实现可供研究；本仓库未复制其 GPL 源码）
 - [CrossDesk Android](https://github.com/kunkundi/crossdesk/tree/mcp/apps/android)（参考其移动端鼠标输入、分辨率请求/确认与帧率设置思路；协议和服务端不同，未复制 GPL 源代码）
+- [noVNC-ARD Apple display protocol research](https://github.com/peetinc/noVNC-ARD)（参考其公开的 Apple `DisplayInfo`/`SetDisplay` 报文定义，**未复制其 MPL-2.0 源码**；协议实现独立编写）
 
 ## Roadmap
 

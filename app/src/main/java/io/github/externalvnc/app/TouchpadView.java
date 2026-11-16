@@ -23,6 +23,7 @@ public final class TouchpadView extends View {
 
     private RfbClient client;
     private float mouseSpeed = 2f;
+    private float scrollSpeed = 2.5f;
     private InputListener inputListener;
     private CaptureListener captureListener;
     private boolean hoverKnown;
@@ -31,6 +32,7 @@ public final class TouchpadView extends View {
     private long downTime;
     private boolean moved;
     private boolean twoFingerTap, twoFingerMoved, dragging;
+    private float twoFingerStartX, twoFingerStartY;
     private final int touchSlop;
     private final Runnable beginDrag = () -> {
         if (!moved && !twoFingerTap && client != null && !dragging) {
@@ -53,6 +55,7 @@ public final class TouchpadView extends View {
         this.client = client;
     }
     public void setMouseSpeed(float mouseSpeed) { this.mouseSpeed = mouseSpeed; }
+    public void setScrollSpeed(float scrollSpeed) { this.scrollSpeed = scrollSpeed; }
     public void setInputListener(InputListener listener) { inputListener = listener; }
     public void setCaptureListener(CaptureListener listener) { captureListener = listener; }
 
@@ -65,8 +68,8 @@ public final class TouchpadView extends View {
         if (client != null) {
             // The full touchpad width/height corresponds to the full remote screen.
             // A fixed 1.8x multiplier never preserved that proportional mapping.
-            float scaleX = client.getFramebufferWidth() / (float) Math.max(1, getWidth());
-            float scaleY = client.getFramebufferHeight() / (float) Math.max(1, getHeight());
+            float scaleX = client.getInteractionWidth() / (float) Math.max(1, getWidth());
+            float scaleY = client.getInteractionHeight() / (float) Math.max(1, getHeight());
             client.sendRelativeMove(dx * scaleX * mouseSpeed,
                     dy * scaleY * mouseSpeed);
         }
@@ -78,9 +81,10 @@ public final class TouchpadView extends View {
         if (inputListener != null) inputListener.onClick(button);
     }
 
-    private void emitScroll(boolean up) {
-        if (client != null) client.scroll(up);
-        if (inputListener != null) inputListener.onScroll(up);
+    private void emitScroll(boolean up, int steps) {
+        if (client != null) client.scrollSteps(up, steps);
+        if (inputListener != null)
+            for (int i = 0; i < steps; i++) inputListener.onScroll(up);
     }
 
     private void stopDrag() {
@@ -121,6 +125,7 @@ public final class TouchpadView extends View {
                     twoFingerMoved = false;
                     lastX = (event.getX(0) + event.getX(1)) / 2f;
                     lastY = (event.getY(0) + event.getY(1)) / 2f;
+                    twoFingerStartX = lastX; twoFingerStartY = lastY;
                 } else twoFingerTap = false;
                 moved = true;
                 return true;
@@ -141,13 +146,16 @@ public final class TouchpadView extends View {
                 }
                 if (client != null || inputListener != null) {
                     if (multiple) {
-                        if (Math.hypot(dx, dy) > touchSlop / 2f) twoFingerMoved = true;
+                        if (Math.hypot(newX - twoFingerStartX,
+                                newY - twoFingerStartY) > touchSlop) twoFingerMoved = true;
                         wheel += dy;
-                        while (Math.abs(wheel) >= 30) {
+                        float threshold = 30f / scrollSpeed;
+                        if (Math.abs(wheel) >= threshold) {
                             boolean up = wheel < 0;
-                            emitScroll(up);
+                            int steps = Math.min(8, (int) (Math.abs(wheel) / threshold));
+                            emitScroll(up, steps);
                             twoFingerMoved = true;
-                            wheel += up ? 30 : -30;
+                            wheel += up ? steps * threshold : -steps * threshold;
                         }
                     } else {
                         emitMove(dx, dy);
@@ -176,7 +184,11 @@ public final class TouchpadView extends View {
     @Override public boolean onGenericMotionEvent(MotionEvent event) {
         if (event.getActionMasked() == MotionEvent.ACTION_SCROLL) {
             float dy = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
-            if (dy != 0) { emitScroll(dy > 0); return true; }
+            if (dy != 0) {
+                emitScroll(dy > 0, Math.max(1, Math.min(8,
+                        Math.round(Math.abs(dy) * scrollSpeed))));
+                return true;
+            }
         }
         if (event.getActionMasked() == MotionEvent.ACTION_HOVER_ENTER) {
             hoverKnown = false;

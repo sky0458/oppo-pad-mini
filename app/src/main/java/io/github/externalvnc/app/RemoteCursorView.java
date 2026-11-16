@@ -15,6 +15,7 @@ final class RemoteCursorView extends View {
     private int remoteWidth, remoteHeight, cursorX, cursorY;
     private int scaleMode;
     private float userScale = 1f;
+    private int viewX, viewY, viewWidth, viewHeight;
 
     RemoteCursorView(Context context) {
         super(context);
@@ -55,16 +56,30 @@ final class RemoteCursorView extends View {
         invalidate();
     }
 
+    void setViewport(int x, int y, int w, int h) {
+        viewX = x; viewY = y;
+        viewWidth = Math.max(0, w);
+        viewHeight = Math.max(0, h);
+        invalidate();
+    }
+
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
         if (remoteWidth == 0 || remoteHeight == 0) return;
-        float wRatio = getWidth() / (float) remoteWidth;
-        float hRatio = getHeight() / (float) remoteHeight;
+        int originX = viewWidth > 0 ? Math.max(0, viewX) : 0;
+        int originY = viewHeight > 0 ? Math.max(0, viewY) : 0;
+        int contentW = viewWidth > 0 ? Math.min(viewWidth, remoteWidth - originX) : remoteWidth;
+        int contentH = viewHeight > 0 ? Math.min(viewHeight, remoteHeight - originY) : remoteHeight;
+        if (contentW <= 0 || contentH <= 0
+                || cursorX < originX || cursorY < originY
+                || cursorX >= originX + contentW || cursorY >= originY + contentH) return;
+        float wRatio = getWidth() / (float) contentW;
+        float hRatio = getHeight() / (float) contentH;
         float factor = scaleMode == 1 ? Math.max(wRatio, hRatio) : Math.min(wRatio, hRatio);
-        float frameWidth = scaleMode == 2 ? getWidth() : remoteWidth * factor;
-        float frameHeight = scaleMode == 2 ? getHeight() : remoteHeight * factor;
-        float x = (getWidth() - frameWidth) / 2f + cursorX * frameWidth / remoteWidth;
-        float y = (getHeight() - frameHeight) / 2f + cursorY * frameHeight / remoteHeight;
+        float frameWidth = scaleMode == 2 ? getWidth() : contentW * factor;
+        float frameHeight = scaleMode == 2 ? getHeight() : contentH * factor;
+        float x = (getWidth() - frameWidth) / 2f + (cursorX - originX) * frameWidth / contentW;
+        float y = (getHeight() - frameHeight) / 2f + (cursorY - originY) * frameHeight / contentH;
         canvas.save();
         canvas.translate(x, y);
         // 22 px tall on a 1080p screen; stays modest on high-DPI HDMI displays.

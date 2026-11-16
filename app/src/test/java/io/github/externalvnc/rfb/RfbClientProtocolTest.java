@@ -30,6 +30,118 @@ public class RfbClientProtocolTest {
         assertEquals(0xff7b7d7b, RfbClient.decodeRgb565(0x7bef));
     }
 
+    @Test public void appleDisplayInfoAllowsSwitchingPhysicalScreens() throws Exception {
+        ExecutorService threads = Executors.newFixedThreadPool(2);
+        try (ServerSocket server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
+            CountDownLatch displaysReceived = new CountDownLatch(1);
+            CountDownLatch displaySelected = new CountDownLatch(1);
+            CountDownLatch layoutUpdated = new CountDownLatch(1);
+            AtomicReference<String> failure = new AtomicReference<>();
+            AtomicReference<java.util.List<RfbClient.RemoteDisplay>> reported = new AtomicReference<>();
+            Future<?> serverFuture = threads.submit(() -> {
+                try (Socket socket = server.accept()) {
+                    socket.setSoTimeout(10000);
+                    DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+                    DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+                    out.write("RFB 003.889\n".getBytes(StandardCharsets.US_ASCII)); out.flush();
+                    byte[] greeting = new byte[12]; in.readFully(greeting);
+                    assertEquals("RFB 003.008\n", new String(greeting, StandardCharsets.US_ASCII));
+                    out.writeByte(1); out.writeByte(1); out.flush();
+                    assertEquals(1, in.readUnsignedByte());
+                    out.writeInt(0); out.flush();
+                    assertEquals(1, in.readUnsignedByte());
+                    out.writeShort(8); out.writeShort(4); out.write(new byte[16]);
+                    out.writeInt(5); out.write("apple".getBytes(StandardCharsets.US_ASCII));
+                    out.flush();
+                    byte[] pixelFormat = new byte[20]; in.readFully(pixelFormat);
+                    assertEquals(2, in.readUnsignedByte());
+                    assertEquals(0, in.readUnsignedByte());
+                    assertEquals(7, in.readUnsignedShort());
+                    int[] encodings = new int[7];
+                    for (int i = 0; i < encodings.length; i++) encodings[i] = in.readInt();
+                    assertTrue(Arrays.stream(encodings).anyMatch(id -> id == 1101));
+                    assertTrue(Arrays.stream(encodings).anyMatch(id -> id == 1105));
+                    assertFalse(readUpdateRequestIncremental(in));
+
+                    // Apple DisplayInfo rectangle: two physical screens, IDs 101/202.
+                    out.writeByte(0); out.writeByte(0); out.writeShort(1);
+                    writeRectangleHeader(out, 0, 0, 8, 4, 1101);
+                    out.writeShort(8); out.writeShort(4); out.writeShort(2); out.writeShort(0);
+                    for (int id : new int[]{101, 202}) {
+                        out.writeInt(id); out.writeShort(4); out.writeShort(4);
+                        out.writeInt(0); out.write(new byte[16]);
+                    }
+                    out.flush();
+                    assertTrue(readUpdateRequestIncremental(in));
+
+                    assertEquals(0x0d, in.readUnsignedByte());
+                    assertEquals(0, in.readUnsignedByte()); // switch one screen
+                    assertEquals(0, in.readUnsignedShort());
+                    assertEquals(202, in.readInt());
+                    displaySelected.countDown();
+
+                    // Apple DisplayInfo2: new framebuffer 4x4, two monitor identities.
+                    out.writeByte(0); out.writeByte(0); out.writeShort(1);
+                    writeRectangleHeader(out, 0, 0, 4, 4, 1105);
+                    out.writeShort(20 + 2 * 56);
+                    out.writeShort(1); out.writeInt(0); // version and header reserved
+                    out.writeShort(4); out.writeShort(4); // framebuffer width/height
+                    out.writeInt(202); out.writeInt(0); out.writeShort(2);
+                    for (int n = 0; n < 2; n++) {
+                        out.writeLong(Double.doubleToLongBits(1.0));
+                        out.writeLong(Double.doubleToLongBits(1.0));
+                        out.writeInt(n == 0 ? 101 : 202);
+                        out.writeShort(0); out.writeShort(n * 4);
+                        out.writeShort(4); out.writeShort((n + 1) * 4);
+                        out.writeShort(0); out.writeShort(n * 4);
+                        out.writeShort(4); out.writeShort((n + 1) * 4);
+                        out.writeInt(n == 0 ? 1 : 0);
+                        out.write(new byte[16]);
+                    }
+                    out.flush();
+                    assertFalse(readUpdateRequestIncremental(in)); // new screen requires full repaint
+                    layoutUpdated.countDown();
+                    assertEquals(-1, in.read());
+                    return null;
+                }
+            });
+            RfbClient client = new RfbClient("127.0.0.1", server.getLocalPort(), "", "",
+                    RfbClient.AuthMode.AUTO, new RfbClient.Listener() {
+                @Override public void onConnected(String name, int w, int h) { }
+                @Override public void onFrame(int w, int h, int[] pixels) { }
+                @Override public void onError(String message) { failure.set(message); }
+                @Override public void onDisconnected() { }
+                @Override public void onDiagnostic(String message) { }
+                @Override public void onRemoteDisplaysChanged(
+                        java.util.List<RfbClient.RemoteDisplay> displays, boolean canSwitch) {
+                    if (canSwitch && displays.size() == 2) {
+                        reported.set(displays);
+                        displaysReceived.countDown();
+                    }
+                }
+            });
+            Future<?> clientFuture = threads.submit(client::runBlocking);
+            try {
+                assertTrue(displaysReceived.await(10, TimeUnit.SECONDS));
+                assertTrue(client.supportsDisplaySwitch());
+                assertEquals(101, client.getRemoteDisplays().get(0).id);
+                assertTrue(client.selectAppleDisplay(202L));
+                assertTrue(displaySelected.await(10, TimeUnit.SECONDS));
+                assertTrue(layoutUpdated.await(10, TimeUnit.SECONDS));
+                assertEquals(4, client.getFramebufferWidth());
+                assertEquals(4, client.getFramebufferHeight());
+                assertEquals(4, reported.get().get(1).width);
+            } finally {
+                client.close();
+                clientFuture.get(10, TimeUnit.SECONDS);
+            }
+            serverFuture.get(10, TimeUnit.SECONDS);
+            assertNull(failure.get());
+        } finally {
+            threads.shutdownNow();
+        }
+    }
+
     @Test public void extendedDesktopSizeMustBeAdvertisedBeforeResizeRequest() throws Exception {
         ExecutorService threads = Executors.newFixedThreadPool(2);
         try (ServerSocket server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {

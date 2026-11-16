@@ -5,6 +5,7 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.view.View;
 
@@ -23,6 +24,7 @@ public final class RemoteFrameView extends View {
     private boolean firstViewDrawLogged;
     private boolean firstBitmapDrawLogged;
     private boolean diagnosticPattern;
+    private Rect viewport;
 
     public RemoteFrameView(Context context) {
         super(context);
@@ -31,6 +33,11 @@ public final class RemoteFrameView extends View {
 
     public void setScaleMode(int mode) {
         scaleMode = mode;
+        invalidate();
+    }
+
+    public void setViewport(int x, int y, int w, int h) {
+        viewport = w > 0 && h > 0 ? new Rect(x, y, x + w, y + h) : null;
         invalidate();
     }
 
@@ -102,18 +109,23 @@ public final class RemoteFrameView extends View {
             return;
         }
         if (bitmap != null && !bitmap.isRecycled()) {
-            float widthRatio = getWidth() / (float) bitmap.getWidth();
-            float heightRatio = getHeight() / (float) bitmap.getHeight();
+            Rect source = viewport == null ? new Rect(0, 0, bitmap.getWidth(), bitmap.getHeight())
+                    : new Rect(Math.max(0, viewport.left), Math.max(0, viewport.top),
+                    Math.min(bitmap.getWidth(), viewport.right),
+                    Math.min(bitmap.getHeight(), viewport.bottom));
+            if (source.isEmpty()) return;
+            float widthRatio = getWidth() / (float) source.width();
+            float heightRatio = getHeight() / (float) source.height();
             float scale = scaleMode == 1
                     ? Math.max(widthRatio, heightRatio)
                     : Math.min(widthRatio, heightRatio);
-            float displayW = scaleMode == 2 ? getWidth() : bitmap.getWidth() * scale;
-            float displayH = scaleMode == 2 ? getHeight() : bitmap.getHeight() * scale;
+            float displayW = scaleMode == 2 ? getWidth() : source.width() * scale;
+            float displayH = scaleMode == 2 ? getHeight() : source.height() * scale;
             float left = (getWidth() - displayW) / 2f;
             float top = (getHeight() - displayH) / 2f;
             paint.setColor(Color.WHITE);
             try {
-                canvas.drawBitmap(bitmap, null, new RectF(left, top,
+                canvas.drawBitmap(bitmap, source, new RectF(left, top,
                         left + displayW, top + displayH), paint);
                 if (!firstBitmapDrawLogged) {
                     firstBitmapDrawLogged = true;
