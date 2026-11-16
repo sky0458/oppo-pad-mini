@@ -74,6 +74,15 @@ Android 平板外接 HDMI 显示器时，使用 Android Presentation API 在**�
 
 不要为排查而直接强制结束 macOS `WindowServer`；那会中断当前图形会话并可能丢失未保存的工作。
 
+## v0.5.0：外屏鼠标、分辨率、帧率及性能
+
+- **HDMI 虚拟鼠标**：在 Presentation 上覆盖独立透明光标层。捕获/释放硬件指针都不影响外屏光标显示；光标立即跟随本地事件，不必等待 VNC 网络往返。使用 Android Pointer Capture 的相对位移轴，降低抓取模式跳动和迟滞。
+- **局部更新与 zlib**：支持 macOS VNC 的 `zlib(6)` 压缩，同时保留 Raw、CopyRect 回退。以独立的不可变矩形更新位图，平时不再为每帧复制整张 2880×1800 桌面；UI 积压时会合并为一张完整快照，确保画面不会漏更新。
+- **分辨率选择**：提供 1280×720、1600×900、1920×1080、2560×1440、2880×1800、3840×2160，以及自定义宽高。只有 VNC 服务器明确声明 `ExtendedDesktopSize(-308)`，才发送标准 RFB `SetDesktopSize(251)` 请求。**macOS 系统自带屏幕共享很可能不声明此能力**：这时应用会说明限制，请先在 Mac 的“系统设置 → 显示器”调整；“画面缩放”不等于修改远端分辨率。
+- **请求帧率上限**：默认 30 FPS，可设 60/90 FPS，重启应用后保留。界面另外显示实际接收帧率。**目标 FPS 是客户端的最大请求频率，不能强迫 macOS VNC 服务端输出相应帧数**；性能还受网络、Mac 采集速度及压缩算法影响。CrossDesk 的 H.264/AV1 视频流与本项目传统 VNC 属于不同协议，不能直接复制其 FPS/分辨率控制消息。
+
+如需真正稳定 60/90 FPS，应在远端使用支持高刷新率的视频流协议服务端，或改造服务端；仅把 UI 数字设成 90 不能提升实际刷新率。
+
 ## 技术结构
 
 - Android Java 17 / Gradle / minSdk 26
@@ -85,7 +94,9 @@ Android 平板外接 HDMI 显示器时，使用 Android Presentation API 在**�
 
 - VNC 密码验证 (RFB SecurityType 2) 和 Mac 本地账号密码认证 (RFB SecurityType 30)
 - 本地日志自动保存（大小上限、轮转），查看、复制、导出 `.log` 文件
-- Raw、CopyRect、DesktopSize 编码
+- zlib、Raw、CopyRect、DesktopSize、ExtendedDesktopSize 编码（后者需服务端支持）
+- HDMI 独立虚拟鼠标光标，局部帧更新，目标帧率 30/60/90 FPS 与实测 FPS
+- 预设/自定义分辨率请求（服务端可选支持）
 - 触控板左键点击、滚轮、键盘按键和鼠标指针捕获
 - 外屏缩放：适应、裁切铺满、拉伸铺满
 - 不保存任何密码；保存主机和端口；日志不记录用户名/密码
@@ -94,7 +105,7 @@ Android 平板外接 HDMI 显示器时，使用 Android Presentation API 在**�
 
 - **不支持** Apple Remote Desktop 其他认证类型 33 / 35 / 36（RSA-SRP / Kerberos / SRP）；仅实现 30（DH），需 Mac 实机验证。
 - **不支持** TLS / VeNCrypt / SSH 隧道。RFB 认证并不代表画面/输入通道加密，请只在可信局域网或 ZeroTier 等加密内网中使用。
-- **暂不支持** Tight / ZRLE / H.264 压缩：Raw 对带宽敏感，高分辨率和高帧率下性能有限。这一版本以验证 ColorOS 外屏能力为先。
+- **暂不支持** Tight / ZRLE / H.264 压缩：已支持 zlib，但传统 VNC 高分辨率和高帧率下仍有限制。
 - VNC 服务端输出比例和外屏比例不同，适应模式仍可能出现黑边；可以切换裁切或拉伸，但这不是远程桌面分辨率自动协商。
 - 不保证所有 ColorOS 17 设备都开放独立外屏 Display / Presentation。
 
@@ -105,6 +116,7 @@ Android 平板外接 HDMI 显示器时，使用 Android Presentation API 在**�
 - [RFB 扩展规范：Diffie-Hellman Authentication (30)](https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst)
 - [AVNC](https://github.com/gujjwal00/avnc)（成熟客户端，可作为后续 LibVNCClient/TLS 接入参考）
 - [DroidVM](https://github.com/Droid-VM/DroidVM)（开源项目中已存在 VNC + Presentation 多屏实现可供研究；本仓库未复制其 GPL 源码）
+- [CrossDesk Android](https://github.com/kunkundi/crossdesk/tree/mcp/apps/android)（参考其移动端鼠标输入、分辨率请求/确认与帧率设置思路；协议和服务端不同，未复制 GPL 源代码）
 
 ## Roadmap
 

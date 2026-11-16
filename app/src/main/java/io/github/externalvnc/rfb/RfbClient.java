@@ -9,16 +9,22 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.LockSupport;
+import java.util.zip.Inflater;
+import java.util.zip.DataFormatException;
 import javax.crypto.Cipher;
 import javax.crypto.spec.SecretKeySpec;
 
 /**
  * Minimal pure-Java open-source RFB/VNC client (RFC 6143).
- * Security: VncAuth/None/Apple DH (type 30). Encodings: Raw, CopyRect, DesktopSize.
+ * Security: VncAuth/None/Apple DH (type 30). Encodings: zlib, Raw, CopyRect, DesktopSize,
+ * ExtendedDesktopSize (when the server offers it).
  * No TLS or session-wide encryption; use a trusted encrypted tunnel.
  */
 public final class RfbClient implements AutoCloseable {
@@ -28,9 +34,30 @@ public final class RfbClient implements AutoCloseable {
         void onConnected(String desktopName, int width, int height);
         /** Frame pixels are reused by the reader thread; copy before asynchronous processing. */
         void onFrame(int width, int height, int[] pixels);
+        /** Opt in to immutable dirty rectangles instead of copying every full desktop frame. */
+        default boolean usesFrameRegions() { return false; }
+        /** currentPixels is reader-owned, usable synchronously for overflow recovery only. */
+        default void onFrameRegions(int width, int height, List<FrameRegion> regions,
+                                    int[] currentPixels) { }
+        /** Called locally before sending the mouse packet, so the cursor remains responsive. */
+        default void onPointerMoved(int x, int y, int width, int height) { }
+        default void onResizeCapabilityChanged(boolean supported) { }
         void onError(String error);
         void onDisconnected();
         void onDiagnostic(String message);
+    }
+
+    public static final class FrameRegion {
+        public final int x, y, width, height;
+        public final int[] argb;
+
+        public FrameRegion(int x, int y, int width, int height, int[] argb) {
+            this.x = x;
+            this.y = y;
+            this.width = width;
+            this.height = height;
+            this.argb = argb;
+        }
     }
 
     private static final int MAX_PIXELS = 16_777_216;
@@ -52,9 +79,14 @@ public final class RfbClient implements AutoCloseable {
     private volatile Socket socket;
     private volatile DataOutputStream output;
     private volatile int width, height, cursorX, cursorY;
+    private volatile int targetFps = 30;
+    private volatile boolean extendedDesktopSize;
+    private volatile int primaryScreenId;
     private volatile int buttonMask;
     private int[] pixels;
+    private final Inflater zlibInflater = new Inflater();
     private int framebufferUpdates;
+    private long lastUpdateRequestNanos;
 
     public RfbClient(String host, int port, String username, String password,
                      AuthMode authMode, Listener listener) {
@@ -87,6 +119,7 @@ public final class RfbClient implements AutoCloseable {
                         // DesktopSize invalidates the local pixel buffer. Ask for a full
                         // repaint rather than waiting for incremental damage that may never arrive.
                         boolean needsFullRefresh = readFramebufferUpdate(in);
+                        paceFrameRequests();
                         requestUpdate(!needsFullRefresh);
                         break;
                     case 1: // SetColorMapEntries
@@ -112,6 +145,7 @@ public final class RfbClient implements AutoCloseable {
             }
         } finally {
             close();
+            zlibInflater.end();
             listener.onDisconnected();
         }
     }
@@ -206,6 +240,7 @@ public final class RfbClient implements AutoCloseable {
         ready.set(true);
         listener.onDiagnostic("ServerInit desktop=" + width + "x" + height + " (connected)");
         listener.onConnected(new String(name, StandardCharsets.UTF_8), width, height);
+        listener.onPointerMoved(cursorX, cursorY, width, height);
         requestUpdate(false);
     }
 
@@ -224,8 +259,10 @@ public final class RfbClient implements AutoCloseable {
 
     private void setEncodings() throws IOException {
         synchronized (writeLock) {
-            output.writeByte(2); output.writeByte(0); output.writeShort(3);
-            output.writeInt(1); output.writeInt(0); output.writeInt(-223);
+            // macOS supports zlib (6), which drastically reduces 32bpp bandwidth.
+            output.writeByte(2); output.writeByte(0); output.writeShort(5);
+            output.writeInt(6); output.writeInt(1); output.writeInt(0); output.writeInt(-223);
+            output.writeInt(-308); // ExtendedDesktopSize: server must advertise before client resizes.
             output.flush();
         }
     }
@@ -236,7 +273,49 @@ public final class RfbClient implements AutoCloseable {
             output.writeShort(0); output.writeShort(0);
             output.writeShort(width); output.writeShort(height);
             output.flush();
+            lastUpdateRequestNanos = System.nanoTime();
         }
+    }
+
+    private void paceFrameRequests() {
+        long interval = 1_000_000_000L / targetFps;
+        long remaining = interval - (System.nanoTime() - lastUpdateRequestNanos);
+        if (remaining > 0 && remaining <= interval) LockSupport.parkNanos(remaining);
+    }
+
+    public void setTargetFps(int fps) {
+        if (fps != 30 && fps != 60 && fps != 90)
+            throw new IllegalArgumentException("FPS must be 30, 60 or 90");
+        targetFps = fps;
+        listener.onDiagnostic("Target frame request rate=" + fps + " FPS (server/network may be slower)");
+    }
+
+    public int getTargetFps() { return targetFps; }
+
+    public boolean supportsRemoteResize() { return extendedDesktopSize; }
+
+    /** This changes the Mac desktop only if its VNC server advertised RFB ExtendedDesktopSize. */
+    public boolean requestDesktopResize(int requestedWidth, int requestedHeight) {
+        if (requestedWidth < 1 || requestedHeight < 1
+                || (long) requestedWidth * requestedHeight > MAX_PIXELS
+                || requestedWidth > 65535 || requestedHeight > 65535
+                || !extendedDesktopSize) return false;
+        return enqueueOutbound(() -> {
+            synchronized (writeLock) {
+                output.writeByte(251); // SetDesktopSize
+                output.writeByte(0);
+                output.writeShort(requestedWidth);
+                output.writeShort(requestedHeight);
+                output.writeByte(1); // one screen
+                output.write(new byte[1 + 2]);
+                output.writeInt(primaryScreenId); // server-advertised screen id
+                output.writeShort(0); output.writeShort(0);
+                output.writeShort(requestedWidth); output.writeShort(requestedHeight);
+                output.writeInt(0); // flags
+                output.flush();
+            }
+            listener.onDiagnostic("SetDesktopSize request " + requestedWidth + "x" + requestedHeight);
+        });
     }
 
     /** Manually request a full screen update if the server sent a blank/incomplete frame. */
@@ -253,13 +332,63 @@ public final class RfbClient implements AutoCloseable {
         width = w; height = h;
         pixels = new int[w * h];
         cursorX = w / 2; cursorY = h / 2;
+        listener.onPointerMoved(cursorX, cursorY, w, h);
+    }
+
+    private FrameRegion snapshotRegion(int x, int y, int w, int h) {
+        int[] copy = new int[w * h];
+        for (int row = 0; row < h; row++)
+            System.arraycopy(pixels, (y + row) * width + x, copy, row * w, w);
+        return new FrameRegion(x, y, w, h, copy);
+    }
+
+    private void readZlibRegion(DataInputStream in, int x, int y, int w, int h) throws IOException {
+        int compressedLength = in.readInt();
+        long maximum = (long) w * h * 4 + 65536;
+        if (compressedLength < 1 || compressedLength > maximum)
+            throw new IOException("Invalid zlib rectangle size=" + compressedLength);
+        byte[] compressed = new byte[compressedLength];
+        in.readFully(compressed);
+        byte[] decoded = new byte[w * h * 4];
+        if (!zlibInflater.needsInput())
+            throw new IOException("Previous zlib rectangle has trailing compressed input");
+        zlibInflater.setInput(compressed);
+        int length = 0;
+        try {
+            while (length < decoded.length) {
+                int count = zlibInflater.inflate(decoded, length, decoded.length - length);
+                if (count == 0) throw new IOException("Truncated or invalid VNC zlib rectangle");
+                length += count;
+            }
+            // Consume the SYNC_FLUSH marker of this persistent compression stream.
+            byte[] flush = new byte[32];
+            while (!zlibInflater.needsInput()) {
+                int before = zlibInflater.getRemaining();
+                int count = zlibInflater.inflate(flush);
+                if (count != 0) throw new IOException("Extra decompressed zlib pixels");
+                if (!zlibInflater.needsInput() && before == zlibInflater.getRemaining())
+                    throw new IOException("Invalid zlib stream boundary");
+            }
+        } catch (DataFormatException error) {
+            throw new IOException("Invalid VNC zlib compressed frame", error);
+        }
+        for (int row = 0; row < h; row++) {
+            int at = (y + row) * width + x;
+            for (int col = 0, pos = row * w * 4; col < w; col++, pos += 4) {
+                int blue = decoded[pos] & 255;
+                int green = decoded[pos + 1] & 255;
+                int red = decoded[pos + 2] & 255;
+                pixels[at + col] = 0xff000000 | red << 16 | green << 8 | blue;
+            }
+        }
     }
 
     /** Returns true when an updated desktop size requires a non-incremental repaint. */
     private boolean readFramebufferUpdate(DataInputStream in) throws IOException {
         in.readUnsignedByte(); // pad
         int count = in.readUnsignedShort();
-        int rawRects = 0, copyRects = 0, resizeRects = 0;
+        int rawRects = 0, zlibRects = 0, copyRects = 0, resizeRects = 0;
+        List<FrameRegion> patches = listener.usesFrameRegions() ? new ArrayList<>() : null;
         long rawPixels = 0, nonBlackRawPixels = 0, nonZeroPaddingBytes = 0;
         for (int i = 0; i < count; i++) {
             int x = in.readUnsignedShort(), y = in.readUnsignedShort();
@@ -269,6 +398,27 @@ public final class RfbClient implements AutoCloseable {
                 if (x != 0 || y != 0) throw new IOException("Invalid DesktopSize");
                 resizeRects++;
                 if (w != width || h != height) resize(w, h);
+                continue;
+            }
+            if (encoding == -308) { // ExtendedDesktopSize; x=reason, y=status
+                int screens = in.readUnsignedByte();
+                skip(in, 3);
+                if (screens < 1 || screens > 16) throw new IOException("Invalid remote screen count");
+                for (int screen = 0; screen < screens; screen++) {
+                    int id = in.readInt();
+                    skip(in, 12); // x/y/width/height/flags
+                    if (screen == 0) primaryScreenId = id;
+                }
+                if (!extendedDesktopSize) {
+                    extendedDesktopSize = true;
+                    listener.onResizeCapabilityChanged(true);
+                }
+                listener.onDiagnostic("ExtendedDesktopSize reply reason=" + x + " status=" + y
+                        + " size=" + w + "x" + h + " screens=" + screens);
+                if (y == 0 && (w != width || h != height)) {
+                    resize(w, h);
+                    resizeRects++;
+                }
                 continue;
             }
             if (w == 0 || h == 0 || x + w > width || y + h > height)
@@ -287,6 +437,9 @@ public final class RfbClient implements AutoCloseable {
                         pixels[at + col] = 0xff000000 | (red << 16) | (green << 8) | blue;
                     }
                 }
+            } else if (encoding == 6) {
+                zlibRects++;
+                readZlibRegion(in, x, y, w, h);
             } else if (encoding == 1) {
                 copyRects++;
                 int sourceX = in.readUnsignedShort(), sourceY = in.readUnsignedShort();
@@ -298,14 +451,19 @@ public final class RfbClient implements AutoCloseable {
                 for (int row = 0; row < h; row++)
                     System.arraycopy(tmp, row * w, pixels, (y + row) * width + x, w);
             } else throw new IOException("Unsupported framebuffer encoding " + encoding);
+            if (patches != null) patches.add(snapshotRegion(x, y, w, h));
         }
         framebufferUpdates++;
         if (framebufferUpdates <= 8 || framebufferUpdates % 60 == 0 || resizeRects > 0)
             listener.onDiagnostic("FramebufferUpdate #" + framebufferUpdates + " rects=" + count
-                    + " raw=" + rawRects + " copy=" + copyRects + " desktopSize=" + resizeRects
+                    + " raw=" + rawRects + " zlib=" + zlibRects
+                    + " copy=" + copyRects + " desktopSize=" + resizeRects
                     + " rawPixels=" + rawPixels + " nonBlackWire=" + nonBlackRawPixels
                     + " nonZero4thByte=" + nonZeroPaddingBytes + " size=" + width + "x" + height);
-        if (rawRects > 0 || copyRects > 0) listener.onFrame(width, height, pixels);
+        if (rawRects > 0 || zlibRects > 0 || copyRects > 0) {
+            if (patches != null) listener.onFrameRegions(width, height, patches, pixels);
+            else listener.onFrame(width, height, pixels);
+        }
         return resizeRects > 0;
     }
 
@@ -383,6 +541,7 @@ public final class RfbClient implements AutoCloseable {
         cursorX = Math.max(0, Math.min(width - 1, x));
         cursorY = Math.max(0, Math.min(height - 1, y));
         final int atX = cursorX, atY = cursorY;
+        listener.onPointerMoved(atX, atY, width, height);
         enqueueOutbound(() -> writePointer(atX, atY, buttons));
     }
 
@@ -396,6 +555,7 @@ public final class RfbClient implements AutoCloseable {
         if (!ready.get() || width == 0 || height == 0) return;
         cursorX = Math.max(0, Math.min(width - 1, cursorX + Math.round(dx)));
         cursorY = Math.max(0, Math.min(height - 1, cursorY + Math.round(dy)));
+        listener.onPointerMoved(cursorX, cursorY, width, height);
         scheduleLatestMotion();
     }
 

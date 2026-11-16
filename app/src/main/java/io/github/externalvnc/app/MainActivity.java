@@ -11,6 +11,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.text.InputType;
 import android.view.Display;
 import android.view.KeyEvent;
@@ -30,6 +31,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
@@ -53,7 +55,22 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     private final AtomicBoolean framePending = new AtomicBoolean();
     private final AtomicBoolean firstFrameLogged = new AtomicBoolean();
     private final AtomicInteger receivedFrames = new AtomicInteger();
+    private final Object renderLock = new Object();
+    private final ArrayDeque<RenderUpdate> renderUpdates = new ArrayDeque<>();
     private final List<Display> displays = new ArrayList<>();
+
+    private static final class RenderUpdate {
+        final int width, height;
+        final List<RfbClient.FrameRegion> regions;
+        final int[] fullPixels;
+
+        RenderUpdate(int width, int height, List<RfbClient.FrameRegion> regions, int[] fullPixels) {
+            this.width = width;
+            this.height = height;
+            this.regions = regions;
+            this.fullPixels = fullPixels;
+        }
+    }
 
     private DisplayManager displayManager;
     private Spinner displaySelector;
@@ -62,6 +79,8 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     private AppLog diagnostics;
     private TextView statusLabel;
     private Button connectButton, scaleButton, captureButton;
+    private Button fpsButton;
+    private TextView fpsStatus;
     private TouchpadView touchpad;
     private ExternalPresentation presentation;
     private InputTestPresentation inputTestPresentation;
@@ -70,6 +89,9 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     private boolean captured;
     private int scaleMode;
     private int pressedButtons;
+    private int targetFps = 30;
+    private long fpsPeriodStart;
+    private int fpsPeriodFrames;
 
     @Override public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -91,6 +113,9 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         refreshDisplays();
         hostField.setText(getPreferences(MODE_PRIVATE).getString("host", ""));
         portField.setText(getPreferences(MODE_PRIVATE).getString("port", "5900"));
+        int savedFps = getPreferences(MODE_PRIVATE).getInt("targetFps", 30);
+        targetFps = savedFps == 60 || savedFps == 90 ? savedFps : 30;
+        fpsButton.setText("目标帧率：" + targetFps);
     }
 
     private void buildInterface() {
@@ -168,6 +193,26 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                     : "已恢复 VNC 画面显示。");
         });
 
+        LinearLayout performanceRow = row(layout);
+        Button resolutionButton = button(performanceRow, "远端分辨率", 1.2f);
+        resolutionButton.setOnClickListener(v -> showResolutionOptions());
+        fpsButton = button(performanceRow, "目标帧率：30", 1.1f);
+        fpsButton.setOnClickListener(v -> new AlertDialog.Builder(this)
+                .setTitle("VNC 请求帧率上限")
+                .setSingleChoiceItems(new String[]{"30 FPS（默认）", "60 FPS", "90 FPS"},
+                        targetFps == 30 ? 0 : targetFps == 60 ? 1 : 2, (dialog, index) -> {
+                            targetFps = new int[]{30, 60, 90}[index];
+                            fpsButton.setText("目标帧率：" + targetFps);
+                            getPreferences(MODE_PRIVATE).edit().putInt("targetFps", targetFps).apply();
+                            if (currentClient != null) currentClient.setTargetFps(targetFps);
+                            diagnostics.add("FPS", "Requested rate cap=" + targetFps);
+                            dialog.dismiss();
+                        })
+                .setNegativeButton("取消", null).show());
+        fpsStatus = label("实际：-- FPS", 12);
+        fpsStatus.setTextColor(0xff93ebd1);
+        performanceRow.addView(fpsStatus, new LinearLayout.LayoutParams(0, dp(48), 1.0f));
+
         LinearLayout inputRow = row(layout);
         inputTestButton = button(inputRow, "键鼠测试（不连接VNC）", 1.6f);
         inputTestButton.setOnClickListener(v -> {
@@ -178,8 +223,8 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         captureButton = button(inputRow, "抓取鼠标", 1f);
         captureButton.setOnClickListener(v -> toggleCapture());
 
-        TextView hint = label("键鼠测试：HDMI 显示虚拟光标和按键；鼠标可在下方触控板区域移动，"
-                + "点击“抓取鼠标”可尝试捕获硬件鼠标；点击触控板使硬件键盘获得焦点。", 12);
+        TextView hint = label("HDMI 现可显示独立白色鼠标光标；在下方触控板操作，或点『抓取鼠标』捕获硬件鼠标。"
+                + "目标 FPS 是请求上限，实际数值见上方；键盘先点击触控板取得焦点。", 12);
         hint.setTextColor(0xffb9c6d4);
         layout.addView(hint);
 
@@ -217,6 +262,73 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         LinearLayout.LayoutParams touchParams = new LinearLayout.LayoutParams(-1, 0, 1);
         touchParams.topMargin = dp(6);
         layout.addView(touchpad, touchParams);
+    }
+
+    private void showResolutionOptions() {
+        RfbClient client = currentClient;
+        if (client == null) { status("请先连接 VNC 再选择远端分辨率。"); return; }
+        String[] options = {"1280 × 720", "1600 × 900", "1920 × 1080",
+                "2560 × 1440", "2880 × 1800", "3840 × 2160", "自定义…"};
+        new AlertDialog.Builder(this)
+                .setTitle("远端桌面分辨率")
+                .setItems(options, (dialog, index) -> {
+                    if (index == options.length - 1) { showCustomResolution(); return; }
+                    int[][] modes = {{1280, 720}, {1600, 900}, {1920, 1080},
+                            {2560, 1440}, {2880, 1800}, {3840, 2160}};
+                    requestRemoteResolution(modes[index][0], modes[index][1]);
+                })
+                .setNeutralButton("能力说明", (dialog, which) -> showResolutionHelp())
+                .setNegativeButton("取消", null).show();
+    }
+
+    private void showCustomResolution() {
+        LinearLayout inputs = new LinearLayout(this);
+        inputs.setPadding(dp(12), dp(4), dp(12), dp(4));
+        EditText widthField = new EditText(this);
+        EditText heightField = new EditText(this);
+        widthField.setHint("宽度，例如 1920");
+        heightField.setHint("高度，例如 1080");
+        widthField.setInputType(InputType.TYPE_CLASS_NUMBER);
+        heightField.setInputType(InputType.TYPE_CLASS_NUMBER);
+        inputs.setOrientation(LinearLayout.VERTICAL);
+        inputs.addView(widthField);
+        inputs.addView(heightField);
+        new AlertDialog.Builder(this).setTitle("自定义远端分辨率")
+                .setView(inputs).setPositiveButton("申请调整", (dialog, which) -> {
+                    try {
+                        int w = Integer.parseInt(widthField.getText().toString());
+                        int h = Integer.parseInt(heightField.getText().toString());
+                        if (w < 320 || h < 240 || (long) w * h > 16_777_216L)
+                            throw new NumberFormatException();
+                        requestRemoteResolution(w, h);
+                    } catch (NumberFormatException ex) {
+                        status("无效分辨率：宽度至少 320、高度至少 240、总像素最多 1677 万。");
+                    }
+                }).setNegativeButton("取消", null).show();
+    }
+
+    private void requestRemoteResolution(int width, int height) {
+        RfbClient client = currentClient;
+        if (client == null || !client.supportsRemoteResize()) {
+            showResolutionHelp();
+            return;
+        }
+        if (client.requestDesktopResize(width, height))
+            status("已向远端请求 " + width + "×" + height + "；等待服务端确认。 ");
+        else status("请求失败：连接未就绪或分辨率超出范围。");
+    }
+
+    private void showResolutionHelp() {
+        new AlertDialog.Builder(this)
+                .setTitle("macOS VNC 分辨率限制")
+                .setMessage("标准 VNC 只能在服务器声明 ExtendedDesktopSize 能力时，"
+                        + "修改真实远端桌面分辨率。\n\n"
+                        + "当前连接" + (currentClient != null && currentClient.supportsRemoteResize()
+                            ? "已声明支持，可选择预设或自定义尺寸。"
+                            : "未声明支持；macOS 内置屏幕共享通常不支持该功能。"
+                            + "\n请在 Mac『系统设置 → 显示器』调整分辨率后，返回本应用点击『远端重绘』；"
+                            + "也可调节『画面：适应/裁切/拉伸』，但后者不会改变远端像素数。"))
+                .setPositiveButton("知道了", null).show();
     }
 
     private TextView label(String text, int sp) {
@@ -443,6 +555,13 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         final RfbClient[] holder = new RfbClient[1];
         firstFrameLogged.set(false);
         receivedFrames.set(0);
+        fpsPeriodStart = SystemClock.elapsedRealtime();
+        fpsPeriodFrames = 0;
+        fpsStatus.setText("实际：-- FPS");
+        synchronized (renderLock) {
+            renderUpdates.clear();
+            framePending.set(false);
+        }
         RfbClient session = new RfbClient(host, port, username, password, mode, new RfbClient.Listener() {
             @Override public void onConnected(String desktop, int width, int height) {
                 ui.post(() -> {
@@ -453,7 +572,35 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
             }
 
             @Override public void onFrame(int width, int height, int[] pixels) {
+                // Compatibility fallback. MainActivity normally uses dirty regions instead.
+                recordFrame(width, height, pixels);
+                queueFrame(holder[0], new RenderUpdate(width, height, null,
+                        Arrays.copyOf(pixels, pixels.length)), pixels);
+            }
+
+            @Override public boolean usesFrameRegions() { return true; }
+
+            @Override public void onFrameRegions(int width, int height,
+                                                  List<RfbClient.FrameRegion> regions,
+                                                  int[] currentPixels) {
+                recordFrame(width, height, currentPixels);
+                queueFrame(holder[0], new RenderUpdate(width, height, regions, null), currentPixels);
+            }
+
+            private void recordFrame(int width, int height, int[] pixels) {
                 int number = receivedFrames.incrementAndGet();
+                fpsPeriodFrames++;
+                long now = SystemClock.elapsedRealtime();
+                long elapsed = now - fpsPeriodStart;
+                if (elapsed >= 2000) {
+                    float actual = fpsPeriodFrames * 1000f / elapsed;
+                    fpsPeriodStart = now;
+                    fpsPeriodFrames = 0;
+                    ui.post(() -> {
+                        if (currentClient == holder[0])
+                            fpsStatus.setText(String.format(Locale.ROOT, "实际：%.1f FPS", actual));
+                    });
+                }
                 if (number <= 3 || number % 60 == 0) {
                     int samples = 0, nonBlack = 0, hasAlpha = 0;
                     int step = Math.max(1, pixels.length / 1024);
@@ -469,24 +616,19 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                 }
                 if (firstFrameLogged.compareAndSet(false, true))
                     diagnostics.add("FRAME", "First framebuffer update " + width + "x" + height);
-                if (!framePending.compareAndSet(false, true)) return;
-                int[] copy = Arrays.copyOf(pixels, pixels.length);
-                ui.post(() -> {
-                    try {
-                        if (currentClient == holder[0] && presentation != null) {
-                            try {
-                                presentation.showFrame(width, height, copy);
-                                if (number == 1)
-                                    status("已提交第一帧到 HDMI；请看显示器左上角的帧号标记。");
-                            } catch (RuntimeException exception) {
-                                diagnostics.add("RENDER", "Error applying frame: " + exception);
-                                status("VNC 已连接但画面绘制失败，请导出日志：" + exception.getMessage());
-                            }
-                        }
-                    } finally {
-                        framePending.set(false);
-                    }
-                });
+            }
+
+            @Override public void onPointerMoved(int x, int y, int width, int height) {
+                Runnable update = () -> {
+                    if (currentClient == holder[0] && presentation != null)
+                        presentation.moveCursor(x, y, width, height);
+                };
+                if (Looper.myLooper() == Looper.getMainLooper()) update.run();
+                else ui.post(update);
+            }
+
+            @Override public void onResizeCapabilityChanged(boolean supported) {
+                diagnostics.add("RFB", "Remote SetDesktopSize capability=" + supported);
             }
 
             @Override public void onError(String error) {
@@ -512,10 +654,51 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
 
         holder[0] = session;
         currentClient = session;
+        session.setTargetFps(targetFps);
         touchpad.setClient(session);
         connectButton.setText("断开 VNC");
         status("正在连接 " + host + ":" + port + " ...");
         worker.submit(session::runBlocking);
+    }
+
+    /** Keep a small render queue; on overload replace pending deltas with an exact full snapshot. */
+    private void queueFrame(RfbClient source, RenderUpdate update, int[] currentPixels) {
+        synchronized (renderLock) {
+            if (source != currentClient) return;
+            if (renderUpdates.size() >= 4) {
+                renderUpdates.clear();
+                update = new RenderUpdate(update.width, update.height, null,
+                        Arrays.copyOf(currentPixels, currentPixels.length));
+                diagnostics.add("RENDER", "UI behind reader; collapsed pending regions to one full frame");
+            }
+            renderUpdates.addLast(update);
+            if (framePending.compareAndSet(false, true)) ui.post(() -> drainFrames(source));
+        }
+    }
+
+    private void drainFrames(RfbClient source) {
+        if (currentClient != source) return;
+        int processed = 0;
+        while (processed++ < 2) {
+            RenderUpdate update;
+            synchronized (renderLock) {
+                update = renderUpdates.pollFirst();
+                if (update == null) {
+                    framePending.set(false);
+                    return;
+                }
+            }
+            if (currentClient != source || presentation == null) continue;
+            try {
+                if (update.fullPixels != null)
+                    presentation.showFrame(update.width, update.height, update.fullPixels);
+                else presentation.showRegions(update.width, update.height, update.regions);
+            } catch (RuntimeException exception) {
+                diagnostics.add("RENDER", "Error applying VNC frame: " + exception);
+                status("VNC 绘制失败，请导出日志：" + exception.getMessage());
+            }
+        }
+        ui.post(() -> drainFrames(source));
     }
 
     private void disconnect() {
@@ -524,6 +707,8 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         currentClient = null;
         if (session != null) session.close();
         touchpad.setClient(null);
+        synchronized (renderLock) { renderUpdates.clear(); }
+        fpsStatus.setText("实际：-- FPS");
         if (captured) toggleCapture();
         connectButton.setText("连接 VNC");
         status("连接已断开；外屏测试窗口仍保持开启。");
@@ -561,8 +746,14 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_MOVE:
             case MotionEvent.ACTION_HOVER_MOVE:
-                float dx = event.getX(), dy = event.getY();
-                if (session != null) session.sendRelativeMove(dx * 1.8f, dy * 1.8f);
+                // Captured pointer motion is relative, not an absolute position in the view.
+                float dx = event.getAxisValue(MotionEvent.AXIS_RELATIVE_X);
+                float dy = event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y);
+                if (dx == 0f && dy == 0f) {
+                    dx = event.getX();
+                    dy = event.getY();
+                }
+                if (session != null) session.sendRelativeMove(dx * 1.25f, dy * 1.25f);
                 if (test != null) test.move(dx, dy);
                 return true;
             case MotionEvent.ACTION_BUTTON_PRESS:

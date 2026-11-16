@@ -9,6 +9,8 @@ import android.graphics.RectF;
 import android.view.View;
 
 import java.util.function.Consumer;
+import java.util.List;
+import io.github.externalvnc.rfb.RfbClient;
 
 /** VNC framebuffer view owned by the external Presentation window. */
 public final class RemoteFrameView extends View {
@@ -57,6 +59,24 @@ public final class RemoteFrameView extends View {
         bitmap.setPixels(pixels, 0, width, 0, 0, width, height);
         framesApplied++;
         if (framesApplied <= 3) log("Bitmap updated #" + framesApplied + " " + width + "x" + height);
+        message = null;
+        invalidate();
+    }
+
+    /** Applies only the changed RFB rectangles, avoiding full-frame bitmap uploads. */
+    public void setRegions(int width, int height, List<RfbClient.FrameRegion> regions) {
+        if (bitmap == null || bitmap.getWidth() != width || bitmap.getHeight() != height) {
+            if (bitmap != null) bitmap.recycle();
+            bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+            bitmap.eraseColor(Color.BLACK);
+        }
+        for (RfbClient.FrameRegion region : regions) {
+            bitmap.setPixels(region.argb, 0, region.width,
+                    region.x, region.y, region.width, region.height);
+        }
+        framesApplied++;
+        if (framesApplied <= 3) log("Bitmap regions #" + framesApplied + " count="
+                + regions.size() + " " + width + "x" + height);
         message = null;
         invalidate();
     }
