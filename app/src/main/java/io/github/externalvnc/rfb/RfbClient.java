@@ -11,6 +11,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -42,6 +44,8 @@ public final class RfbClient implements AutoCloseable {
         /** Called locally before sending the mouse packet, so the cursor remains responsive. */
         default void onPointerMoved(int x, int y, int width, int height) { }
         default void onResizeCapabilityChanged(boolean supported) { }
+        /** Network wait and framebuffer read/decode time, in milliseconds. */
+        default void onFrameTiming(long serverWaitMs, long readDecodeMs, int updateRects) { }
         void onError(String error);
         void onDisconnected();
         void onDiagnostic(String message);
@@ -70,6 +74,7 @@ public final class RfbClient implements AutoCloseable {
     private final AtomicBoolean ready = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicBoolean motionQueued = new AtomicBoolean();
+    private final Set<Integer> keysDown = ConcurrentHashMap.newKeySet();
     /** Every interactive write runs here, never on Android's main thread. */
     private final ExecutorService outbound = Executors.newSingleThreadExecutor(task -> {
         Thread thread = new Thread(task, "rfb-outbound");
@@ -79,12 +84,16 @@ public final class RfbClient implements AutoCloseable {
     private volatile Socket socket;
     private volatile DataOutputStream output;
     private volatile int width, height, cursorX, cursorY;
+    private float motionRemainderX, motionRemainderY;
     private volatile int targetFps = 30;
+    private volatile boolean fastColor = true;
     private volatile boolean extendedDesktopSize;
     private volatile int primaryScreenId;
     private volatile int buttonMask;
     private int[] pixels;
     private final Inflater zlibInflater = new Inflater();
+    private byte[] compressedScratch = new byte[0];
+    private byte[] decodedScratch = new byte[0];
     private int framebufferUpdates;
     private long lastUpdateRequestNanos;
 
@@ -113,12 +122,17 @@ public final class RfbClient implements AutoCloseable {
             negotiate(in);
             connection.setSoTimeout(0);
             while (active.get()) {
+                long requestWaitStart = System.nanoTime();
                 int kind = in.readUnsignedByte();
                 switch (kind) {
                     case 0:
                         // DesktopSize invalidates the local pixel buffer. Ask for a full
                         // repaint rather than waiting for incremental damage that may never arrive.
+                        long decodeStart = System.nanoTime();
                         boolean needsFullRefresh = readFramebufferUpdate(in);
+                        listener.onFrameTiming((decodeStart - requestWaitStart) / 1_000_000,
+                                (System.nanoTime() - decodeStart) / 1_000_000,
+                                lastUpdateRectCount);
                         paceFrameRequests();
                         requestUpdate(!needsFullRefresh);
                         break;
@@ -247,19 +261,31 @@ public final class RfbClient implements AutoCloseable {
     private void setPixelFormat() throws IOException {
         synchronized (writeLock) {
             output.writeByte(0); output.write(new byte[3]);
-            output.writeByte(32); output.writeByte(24); // bpp, depth
-            output.writeByte(0); output.writeByte(1);   // LE, true colour
-            output.writeShort(255); output.writeShort(255); output.writeShort(255);
-            output.writeByte(16); output.writeByte(8); output.writeByte(0); // R G B shift
+            output.writeByte(fastColor ? 16 : 32);
+            output.writeByte(fastColor ? 16 : 24); // bpp, depth
+            output.writeByte(0); output.writeByte(1); // LE, true colour
+            output.writeShort(fastColor ? 31 : 255);
+            output.writeShort(fastColor ? 63 : 255);
+            output.writeShort(fastColor ? 31 : 255);
+            output.writeByte(fastColor ? 11 : 16);
+            output.writeByte(fastColor ? 5 : 8);
+            output.writeByte(0); // R G B shift
             output.write(new byte[3]);
             output.flush();
         }
-        listener.onDiagnostic("Requested pixel format: 32bpp depth24 littleEndian RGB888 shifts=16,8,0");
+        listener.onDiagnostic("Requested pixel format: "
+                + (fastColor ? "16bpp RGB565 fast" : "32bpp RGB888 full color"));
+    }
+
+    /** Set before runBlocking(); changing the wire format during a session is unsafe. */
+    public void setFastColor(boolean enabled) {
+        if (ready.get()) throw new IllegalStateException("Pixel format can only change before connect");
+        fastColor = enabled;
     }
 
     private void setEncodings() throws IOException {
         synchronized (writeLock) {
-            // macOS supports zlib (6), which drastically reduces 32bpp bandwidth.
+            // macOS supports zlib (6). Prefer compressed rectangles to uncompressed Raw.
             output.writeByte(2); output.writeByte(0); output.writeShort(5);
             output.writeInt(6); output.writeInt(1); output.writeInt(0); output.writeInt(-223);
             output.writeInt(-308); // ExtendedDesktopSize: server must advertise before client resizes.
@@ -291,6 +317,8 @@ public final class RfbClient implements AutoCloseable {
     }
 
     public int getTargetFps() { return targetFps; }
+    public int getFramebufferWidth() { return width; }
+    public int getFramebufferHeight() { return height; }
 
     public boolean supportsRemoteResize() { return extendedDesktopSize; }
 
@@ -342,21 +370,40 @@ public final class RfbClient implements AutoCloseable {
         return new FrameRegion(x, y, w, h, copy);
     }
 
+    private int bytesPerPixel() { return fastColor ? 2 : 4; }
+
+    private int decodePixel(byte[] bytes, int at) {
+        if (fastColor) {
+            int value = (bytes[at] & 255) | ((bytes[at + 1] & 255) << 8);
+            return decodeRgb565(value);
+        }
+        return 0xff000000 | ((bytes[at + 2] & 255) << 16)
+                | ((bytes[at + 1] & 255) << 8) | (bytes[at] & 255);
+    }
+
+    static int decodeRgb565(int value) {
+        int r = (value >>> 11) & 31, g = (value >>> 5) & 63, b = value & 31;
+        return 0xff000000 | (((r << 3) | (r >>> 2)) << 16)
+                | (((g << 2) | (g >>> 4)) << 8) | ((b << 3) | (b >>> 2));
+    }
+
     private void readZlibRegion(DataInputStream in, int x, int y, int w, int h) throws IOException {
         int compressedLength = in.readInt();
-        long maximum = (long) w * h * 4 + 65536;
+        int stride = bytesPerPixel();
+        long maximum = (long) w * h * stride + 65536;
         if (compressedLength < 1 || compressedLength > maximum)
             throw new IOException("Invalid zlib rectangle size=" + compressedLength);
-        byte[] compressed = new byte[compressedLength];
-        in.readFully(compressed);
-        byte[] decoded = new byte[w * h * 4];
+        if (compressedScratch.length < compressedLength) compressedScratch = new byte[compressedLength];
+        in.readFully(compressedScratch, 0, compressedLength);
+        int expandedLength = w * h * stride;
+        if (decodedScratch.length < expandedLength) decodedScratch = new byte[expandedLength];
         if (!zlibInflater.needsInput())
             throw new IOException("Previous zlib rectangle has trailing compressed input");
-        zlibInflater.setInput(compressed);
+        zlibInflater.setInput(compressedScratch, 0, compressedLength);
         int length = 0;
         try {
-            while (length < decoded.length) {
-                int count = zlibInflater.inflate(decoded, length, decoded.length - length);
+            while (length < expandedLength) {
+                int count = zlibInflater.inflate(decodedScratch, length, expandedLength - length);
                 if (count == 0) throw new IOException("Truncated or invalid VNC zlib rectangle");
                 length += count;
             }
@@ -374,19 +421,18 @@ public final class RfbClient implements AutoCloseable {
         }
         for (int row = 0; row < h; row++) {
             int at = (y + row) * width + x;
-            for (int col = 0, pos = row * w * 4; col < w; col++, pos += 4) {
-                int blue = decoded[pos] & 255;
-                int green = decoded[pos + 1] & 255;
-                int red = decoded[pos + 2] & 255;
-                pixels[at + col] = 0xff000000 | red << 16 | green << 8 | blue;
+            for (int col = 0, pos = row * w * stride; col < w; col++, pos += stride) {
+                pixels[at + col] = decodePixel(decodedScratch, pos);
             }
         }
     }
 
     /** Returns true when an updated desktop size requires a non-incremental repaint. */
+    private int lastUpdateRectCount;
     private boolean readFramebufferUpdate(DataInputStream in) throws IOException {
         in.readUnsignedByte(); // pad
         int count = in.readUnsignedShort();
+        lastUpdateRectCount = count;
         int rawRects = 0, zlibRects = 0, copyRects = 0, resizeRects = 0;
         List<FrameRegion> patches = listener.usesFrameRegions() ? new ArrayList<>() : null;
         long rawPixels = 0, nonBlackRawPixels = 0, nonZeroPaddingBytes = 0;
@@ -427,15 +473,16 @@ public final class RfbClient implements AutoCloseable {
             if (encoding == 0) {
                 rawRects++;
                 rawPixels += (long) w * h;
-                byte[] line = new byte[w * 4];
+                int stride = bytesPerPixel();
+                byte[] line = new byte[w * stride];
                 for (int row = 0; row < h; row++) {
                     in.readFully(line);
                     int at = (y + row) * width + x;
-                    for (int col = 0, p = 0; col < w; col++, p += 4) {
-                        int blue = line[p] & 255, green = line[p + 1] & 255, red = line[p + 2] & 255;
-                        if ((blue | green | red) != 0) nonBlackRawPixels++;
-                        if (line[p + 3] != 0) nonZeroPaddingBytes++;
-                        pixels[at + col] = 0xff000000 | (red << 16) | (green << 8) | blue;
+                    for (int col = 0, p = 0; col < w; col++, p += stride) {
+                        int color = decodePixel(line, p);
+                        if ((color & 0x00ffffff) != 0) nonBlackRawPixels++;
+                        if (!fastColor && line[p + 3] != 0) nonZeroPaddingBytes++;
+                        pixels[at + col] = color;
                     }
                 }
             } else if (encoding == 6) {
@@ -554,8 +601,13 @@ public final class RfbClient implements AutoCloseable {
     /** Mouse motion is coalesced so that fast hardware mice cannot create an unbounded queue. */
     public void sendRelativeMove(float dx, float dy) {
         if (!ready.get() || width == 0 || height == 0) return;
-        cursorX = Math.max(0, Math.min(width - 1, cursorX + Math.round(dx)));
-        cursorY = Math.max(0, Math.min(height - 1, cursorY + Math.round(dy)));
+        float accumulatedX = dx + motionRemainderX, accumulatedY = dy + motionRemainderY;
+        int wholeX = Math.round(accumulatedX), wholeY = Math.round(accumulatedY);
+        motionRemainderX = accumulatedX - wholeX;
+        motionRemainderY = accumulatedY - wholeY;
+        if (wholeX == 0 && wholeY == 0) return;
+        cursorX = Math.max(0, Math.min(width - 1, cursorX + wholeX));
+        cursorY = Math.max(0, Math.min(height - 1, cursorY + wholeY));
         listener.onPointerMoved(cursorX, cursorY, width, height);
         scheduleLatestMotion();
     }
@@ -586,6 +638,8 @@ public final class RfbClient implements AutoCloseable {
 
     public void sendKey(int keysym, boolean pressed) {
         if (keysym == 0) return;
+        if (pressed) keysDown.add(keysym);
+        else keysDown.remove(keysym);
         enqueueOutbound(() -> {
             synchronized (writeLock) {
                 if (!ready.get() || output == null) return;
@@ -596,6 +650,10 @@ public final class RfbClient implements AutoCloseable {
                 output.flush();
             }
         });
+    }
+
+    public void releaseAllKeys() {
+        for (Integer keysym : new ArrayList<>(keysDown)) sendKey(keysym, false);
     }
 
     @Override public void close() {

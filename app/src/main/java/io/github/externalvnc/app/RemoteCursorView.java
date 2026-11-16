@@ -14,23 +14,25 @@ final class RemoteCursorView extends View {
     private final Path arrow = new Path();
     private int remoteWidth, remoteHeight, cursorX, cursorY;
     private int scaleMode;
+    private float userScale = 1f;
 
     RemoteCursorView(Context context) {
         super(context);
         setClickable(false);
-        outline.setColor(Color.BLACK);
+        // macOS-style black arrow with a thin white contrasting border.
+        outline.setColor(Color.WHITE);
         outline.setStyle(Paint.Style.STROKE);
-        outline.setStrokeWidth(3.5f);
+        outline.setStrokeWidth(2.6f);
         outline.setStrokeJoin(Paint.Join.ROUND);
-        fill.setColor(Color.WHITE);
+        fill.setColor(Color.BLACK);
         fill.setStyle(Paint.Style.FILL);
         arrow.moveTo(0, 0);
         arrow.lineTo(0, 30);
-        arrow.lineTo(7, 23);
-        arrow.lineTo(12, 37);
-        arrow.lineTo(18, 34);
-        arrow.lineTo(12, 20);
-        arrow.lineTo(22, 20);
+        arrow.lineTo(6.3f, 23.5f);
+        arrow.lineTo(12.5f, 38);
+        arrow.lineTo(17.1f, 35.6f);
+        arrow.lineTo(11.2f, 21.8f);
+        arrow.lineTo(21.7f, 21.5f);
         arrow.close();
     }
 
@@ -48,6 +50,11 @@ final class RemoteCursorView extends View {
         invalidate();
     }
 
+    void setCursorScale(float scale) {
+        userScale = Math.max(.5f, Math.min(2f, scale));
+        invalidate();
+    }
+
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
         if (remoteWidth == 0 || remoteHeight == 0) return;
@@ -60,7 +67,10 @@ final class RemoteCursorView extends View {
         float y = (getHeight() - frameHeight) / 2f + cursorY * frameHeight / remoteHeight;
         canvas.save();
         canvas.translate(x, y);
-        float size = Math.max(1.6f, Math.min(getWidth(), getHeight()) / 900f);
+        // 22 px tall on a 1080p screen; stays modest on high-DPI HDMI displays.
+        float defaultHeight = 22f * (float) Math.sqrt(getHeight() / 1080f);
+        defaultHeight = Math.max(17f, Math.min(34f, defaultHeight));
+        float size = defaultHeight / 38f * userScale;
         canvas.scale(size, size);
         canvas.drawPath(arrow, outline);
         canvas.drawPath(arrow, fill);

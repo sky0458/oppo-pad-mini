@@ -8,6 +8,7 @@ import android.content.Intent;
 import android.graphics.Color;
 import android.hardware.display.DisplayManager;
 import android.net.Uri;
+import android.provider.Settings;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -20,10 +21,12 @@ import android.view.View;
 import android.view.WindowManager;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.Spinner;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -80,6 +83,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     private TextView statusLabel;
     private Button connectButton, scaleButton, captureButton;
     private Button fpsButton;
+    private Button accessibilityButton;
     private TextView fpsStatus;
     private TouchpadView touchpad;
     private ExternalPresentation presentation;
@@ -90,6 +94,11 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     private int scaleMode;
     private int pressedButtons;
     private int targetFps = 30;
+    private float cursorScale = 1f;
+    private float mouseSpeed = 2f;
+    private boolean immersiveMouse = true;
+    private boolean fastColor = true;
+    private volatile String performanceSummary = "";
     private long fpsPeriodStart;
     private int fpsPeriodFrames;
 
@@ -116,6 +125,13 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         int savedFps = getPreferences(MODE_PRIVATE).getInt("targetFps", 30);
         targetFps = savedFps == 60 || savedFps == 90 ? savedFps : 30;
         fpsButton.setText("目标帧率：" + targetFps);
+        cursorScale = getPreferences(MODE_PRIVATE).getFloat("cursorScale", 1f);
+        mouseSpeed = getPreferences(MODE_PRIVATE).getFloat("mouseSpeed", 2f);
+        immersiveMouse = getPreferences(MODE_PRIVATE).getBoolean("immersiveMouse", true);
+        fastColor = getPreferences(MODE_PRIVATE).getBoolean("fastColor", true);
+        touchpad.setMouseSpeed(mouseSpeed);
+        captureButton.setText(immersiveMouse ? "沉浸鼠标：待抓取" : "抓取鼠标");
+        VncKeyboardAccessibilityService.attach(this);
     }
 
     private void buildInterface() {
@@ -211,6 +227,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                 .setNegativeButton("取消", null).show());
         fpsStatus = label("实际：-- FPS", 12);
         fpsStatus.setTextColor(0xff93ebd1);
+        fpsStatus.setTextSize(11);
         performanceRow.addView(fpsStatus, new LinearLayout.LayoutParams(0, dp(48), 1.0f));
 
         LinearLayout inputRow = row(layout);
@@ -223,8 +240,13 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         captureButton = button(inputRow, "抓取鼠标", 1f);
         captureButton.setOnClickListener(v -> toggleCapture());
 
-        TextView hint = label("HDMI 现可显示独立白色鼠标光标；在下方触控板操作，或点『抓取鼠标』捕获硬件鼠标。"
-                + "目标 FPS 是请求上限，实际数值见上方；键盘先点击触控板取得焦点。", 12);
+        Button mouseSettingsButton = button(inputRow, "鼠标/画质", 1.1f);
+        mouseSettingsButton.setOnClickListener(v -> showMouseSettings());
+        accessibilityButton = button(inputRow, "无障碍键盘", 1.1f);
+        accessibilityButton.setOnClickListener(v -> showAccessibilityInstructions());
+
+        TextView hint = label("默认沉浸鼠标：连接后尝试自动捕获实体鼠标，移动不受触控板边界限制。"
+                + "光标为 Mac 样式；『鼠标/画质』中可调大小、速度和传输画质。", 12);
         hint.setTextColor(0xffb9c6d4);
         layout.addView(hint);
 
@@ -251,7 +273,11 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         touchpad.setCaptureListener(hasCapture -> {
             captured = hasCapture;
             diagnostics.add("INPUT", "Pointer capture=" + hasCapture);
-            captureButton.setText(hasCapture ? "释放鼠标" : "抓取鼠标");
+            captureButton.setText(hasCapture ? "退出沉浸/释放" : "进入沉浸/抓取");
+            if (!hasCapture) {
+                pressedButtons = 0;
+                if (currentClient != null) currentClient.setButtons(0);
+            }
             if (inputTestPresentation != null) {
                 inputTestPresentation.captured(hasCapture);
                 status(hasCapture ? "鼠标已捕获：移动鼠标，观察 HDMI 绿色虚拟光标。"
@@ -279,6 +305,136 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                 })
                 .setNeutralButton("能力说明", (dialog, which) -> showResolutionHelp())
                 .setNegativeButton("取消", null).show();
+    }
+
+    private void showMouseSettings() {
+        final float originalSpeed = mouseSpeed, originalCursor = cursorScale;
+        final boolean originalImmersive = immersiveMouse, originalColor = fastColor;
+        LinearLayout column = new LinearLayout(this);
+        column.setOrientation(LinearLayout.VERTICAL);
+        column.setPadding(dp(20), dp(8), dp(20), dp(8));
+
+        TextView speedLabel = label("鼠标速度：" + Math.round(mouseSpeed * 100) + "%", 15);
+        column.addView(speedLabel);
+        SeekBar speedBar = new SeekBar(this);
+        speedBar.setMax(350); // 50%–400%
+        speedBar.setProgress(Math.round(mouseSpeed * 100) - 50);
+        speedBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar bar, int progress, boolean user) {
+                mouseSpeed = (progress + 50) / 100f;
+                speedLabel.setText("鼠标速度：" + (progress + 50) + "%");
+                if (touchpad != null) touchpad.setMouseSpeed(mouseSpeed);
+            }
+            @Override public void onStartTrackingTouch(SeekBar bar) { }
+            @Override public void onStopTrackingTouch(SeekBar bar) { }
+        });
+        column.addView(speedBar);
+
+        TextView cursorLabel = label("Mac 光标大小：" + Math.round(cursorScale * 100) + "%", 15);
+        column.addView(cursorLabel);
+        SeekBar cursorBar = new SeekBar(this);
+        cursorBar.setMax(150); // 50%–200%
+        cursorBar.setProgress(Math.round(cursorScale * 100) - 50);
+        cursorBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar bar, int progress, boolean user) {
+                cursorScale = (progress + 50) / 100f;
+                cursorLabel.setText("Mac 光标大小：" + (progress + 50) + "%");
+                if (presentation != null) presentation.setCursorScale(cursorScale);
+            }
+            @Override public void onStartTrackingTouch(SeekBar bar) { }
+            @Override public void onStopTrackingTouch(SeekBar bar) { }
+        });
+        column.addView(cursorBar);
+
+        CheckBox immersiveToggle = new CheckBox(this);
+        immersiveToggle.setText("默认沉浸式鼠标（自动捕获，无移动边界）");
+        immersiveToggle.setChecked(immersiveMouse);
+        immersiveToggle.setOnCheckedChangeListener((button, selected) -> immersiveMouse = selected);
+        column.addView(immersiveToggle);
+
+        CheckBox qualityToggle = new CheckBox(this);
+        qualityToggle.setText("优先流畅：16位省流传输（关闭为32位原彩；重连生效）");
+        qualityToggle.setChecked(fastColor);
+        qualityToggle.setOnCheckedChangeListener((button, selected) -> fastColor = selected);
+        column.addView(qualityToggle);
+
+        new AlertDialog.Builder(this).setTitle("远程鼠标与传输性能")
+                .setView(column).setPositiveButton("保存", (dialog, which) -> {
+                    getPreferences(MODE_PRIVATE).edit()
+                            .putFloat("mouseSpeed", mouseSpeed)
+                            .putFloat("cursorScale", cursorScale)
+                            .putBoolean("immersiveMouse", immersiveMouse)
+                            .putBoolean("fastColor", fastColor).apply();
+                    if (immersiveMouse) requestImmersiveCapture();
+                    else if (touchpad != null && touchpad.hasPointerCapture())
+                        touchpad.releasePointerCapture();
+                    if (currentClient != null)
+                        status("鼠标设置已保存；传输画质在下次连接 VNC 时生效。");
+                }).setNegativeButton("取消", (dialog, which) -> {
+                    mouseSpeed = originalSpeed;
+                    cursorScale = originalCursor;
+                    immersiveMouse = originalImmersive;
+                    fastColor = originalColor;
+                    if (touchpad != null) touchpad.setMouseSpeed(mouseSpeed);
+                    if (presentation != null) presentation.setCursorScale(cursorScale);
+                }).show();
+    }
+
+    private void showAccessibilityInstructions() {
+        new AlertDialog.Builder(this)
+                .setTitle("实体键盘快捷键映射")
+                .setMessage("开启系统无障碍服务『External VNC Display · 键盘转发』后，"
+                        + "当本应用位于前台、VNC 已连接且触控板获得焦点时，"
+                        + "会优先将实体键盘按键与 Ctrl / Alt / Shift / Command 组合发送至 Mac。\n\n"
+                        + "离开应用或在本机输入连接密码时不会转发，也不记录按键内容。"
+                        + "ColorOS/Android 系统保留的部分组合键仍可能无法拦截；"
+                        + "若其他无障碍服务已占用按键过滤，也可能无法生效。")
+                .setPositiveButton("打开无障碍设置", (dialog, which) -> {
+                    try { startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)); }
+                    catch (RuntimeException error) { status("无法打开无障碍设置：" + error.getMessage()); }
+                }).setNegativeButton("稍后", null).show();
+    }
+
+    private void requestImmersiveCapture() {
+        if (!immersiveMouse || currentClient == null || touchpad == null || !hasWindowFocus()) return;
+        touchpad.requestFocus();
+        touchpad.postDelayed(() -> {
+            if (immersiveMouse && currentClient != null && hasWindowFocus()
+                    && !touchpad.hasPointerCapture()) {
+                touchpad.requestPointerCapture();
+                diagnostics.add("INPUT", "Automatic immersive pointer capture requested");
+            }
+        }, 180);
+    }
+
+    boolean forwardAccessibilityKey(KeyEvent event) {
+        if (currentClient == null || !hasWindowFocus() || touchpad == null
+                || getCurrentFocus() != touchpad) return false;
+        int action = event.getAction();
+        if (action != KeyEvent.ACTION_DOWN && action != KeyEvent.ACTION_UP) return false;
+        int keysym = KeySyms.map(event);
+        if (keysym == 0) return false;
+        currentClient.sendKey(keysym, action == KeyEvent.ACTION_DOWN);
+        return true;
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        if (accessibilityButton != null)
+            accessibilityButton.setText(VncKeyboardAccessibilityService.isServiceConnected()
+                    ? "无障碍键盘：已开" : "无障碍键盘：未开");
+        if (touchpad != null && currentClient != null) requestImmersiveCapture();
+    }
+
+    @Override protected void onPause() {
+        if (touchpad != null && touchpad.hasPointerCapture()) touchpad.releasePointerCapture();
+        if (currentClient != null) currentClient.releaseAllKeys();
+        super.onPause();
+    }
+
+    @Override public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) requestImmersiveCapture();
     }
 
     private void showCustomResolution() {
@@ -469,6 +625,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
             next.show();
             next.setDiagnosticListener(message -> diagnostics.add("RENDER", message));
             next.setScaleMode(scaleMode);
+            next.setCursorScale(cursorScale);
             next.showMessage("Presentation OK · Display #" + target.getDisplayId());
             presentation = next;
             status("已创建外屏窗口；请检查 HDMI 显示器是否出现 Presentation OK。");
@@ -568,6 +725,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                     if (currentClient != holder[0]) return;
                     status("已连接 " + desktop + " · " + width + "×" + height);
                     touchpad.requestFocus();
+                    if (immersiveMouse) requestImmersiveCapture();
                 });
             }
 
@@ -598,7 +756,8 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                     fpsPeriodFrames = 0;
                     ui.post(() -> {
                         if (currentClient == holder[0])
-                            fpsStatus.setText(String.format(Locale.ROOT, "实际：%.1f FPS", actual));
+                            fpsStatus.setText(String.format(Locale.ROOT,
+                                    "变化 %.1f FPS\n%s", actual, performanceSummary));
                     });
                 }
                 if (number <= 3 || number % 60 == 0) {
@@ -631,6 +790,19 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                 diagnostics.add("RFB", "Remote SetDesktopSize capability=" + supported);
             }
 
+            private long lastTimingLog;
+            @Override public void onFrameTiming(long serverWaitMs, long readDecodeMs, int updateRects) {
+                long now = SystemClock.elapsedRealtime();
+                performanceSummary = "等 " + serverWaitMs + "ms / 解 " + readDecodeMs + "ms";
+                if (now - lastTimingLog > 3000) {
+                    lastTimingLog = now;
+                    diagnostics.add("PERF", "RFB frame wait=" + serverWaitMs + "ms"
+                            + " readDecode=" + readDecodeMs + "ms rectangles=" + updateRects
+                            + " framebuffer=" + holder[0].getFramebufferWidth() + "x"
+                            + holder[0].getFramebufferHeight());
+                }
+            }
+
             @Override public void onError(String error) {
                 ui.post(() -> {
                     if (currentClient == holder[0]) status("VNC 失败：" + error);
@@ -657,7 +829,9 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         holder[0] = session;
         currentClient = session;
         session.setTargetFps(targetFps);
+        session.setFastColor(fastColor);
         touchpad.setClient(session);
+        touchpad.setMouseSpeed(mouseSpeed);
         connectButton.setText("断开 VNC");
         status("正在连接 " + host + ":" + port + " ...");
         worker.submit(session::runBlocking);
@@ -711,7 +885,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         touchpad.setClient(null);
         synchronized (renderLock) { renderUpdates.clear(); }
         fpsStatus.setText("实际：-- FPS");
-        if (captured) toggleCapture();
+        if (touchpad.hasPointerCapture()) touchpad.releasePointerCapture();
         connectButton.setText("连接 VNC");
         status("连接已断开；外屏测试窗口仍保持开启。");
     }
@@ -725,11 +899,15 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
 
     private void toggleCapture() {
         if (touchpad.hasPointerCapture()) {
+            immersiveMouse = false;
+            getPreferences(MODE_PRIVATE).edit().putBoolean("immersiveMouse", false).apply();
             touchpad.releasePointerCapture();
             pressedButtons = 0;
             if (currentClient != null) currentClient.setButtons(0);
             return;
         }
+        immersiveMouse = true;
+        getPreferences(MODE_PRIVATE).edit().putBoolean("immersiveMouse", true).apply();
         touchpad.requestFocus();
         touchpad.post(() -> {
             touchpad.requestPointerCapture();
@@ -755,7 +933,12 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                     dx = event.getX();
                     dy = event.getY();
                 }
-                if (session != null) session.sendRelativeMove(dx * 1.25f, dy * 1.25f);
+                if (session != null) {
+                    float ratio = session.getFramebufferWidth()
+                            / (float) Math.max(1, getResources().getDisplayMetrics().widthPixels);
+                    float effective = Math.max(1f, ratio) * mouseSpeed;
+                    session.sendRelativeMove(dx * effective, dy * effective);
+                }
                 if (test != null) test.move(dx, dy);
                 return true;
             case MotionEvent.ACTION_BUTTON_PRESS:
@@ -823,6 +1006,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     }
 
     @Override protected void onDestroy() {
+        VncKeyboardAccessibilityService.detach(this);
         displayManager.unregisterDisplayListener(this);
         disconnect();
         closeInputTest();

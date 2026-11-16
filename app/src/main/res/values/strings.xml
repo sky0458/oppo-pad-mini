@@ -1,1 +1,4 @@
-<resources><string name="app_name">External VNC Display</string></resources>
+<resources>
+    <string name="app_name">External VNC Display</string>
+    <string name="accessibility_keyboard_desc">仅在本 VNC 应用位于前台且远程触控板获得焦点时，转发实体键盘及快捷键到远程电脑。不保存或上传按键内容。</string>
+</resources>

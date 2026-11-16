@@ -46,6 +46,10 @@ public final class ExternalPresentation extends Presentation {
         if (cursorView != null) cursorView.moveTo(x, y, width, height);
     }
 
+    public void setCursorScale(float scale) {
+        if (cursorView != null) cursorView.setCursorScale(scale);
+    }
+
     public void setDiagnosticListener(Consumer<String> callback) {
         if (frameView != null) frameView.setDiagnosticListener(callback);
     }

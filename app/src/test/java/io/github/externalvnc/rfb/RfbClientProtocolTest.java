@@ -23,6 +23,13 @@ import static org.junit.Assert.*;
 
 /** End-to-end RFB protocol fixture without needing macOS or an Android device. */
 public class RfbClientProtocolTest {
+    @Test public void rgb565DecoderPreservesPrimaryColorsAndGray() {
+        assertEquals(0xffff0000, RfbClient.decodeRgb565(0xf800));
+        assertEquals(0xff00ff00, RfbClient.decodeRgb565(0x07e0));
+        assertEquals(0xff0000ff, RfbClient.decodeRgb565(0x001f));
+        assertEquals(0xff7b7d7b, RfbClient.decodeRgb565(0x7bef));
+    }
+
     @Test public void extendedDesktopSizeMustBeAdvertisedBeforeResizeRequest() throws Exception {
         ExecutorService threads = Executors.newFixedThreadPool(2);
         try (ServerSocket server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
@@ -43,6 +50,7 @@ public class RfbClientProtocolTest {
                     out.writeShort(4); out.writeShort(4); out.write(new byte[16]);
                     out.writeInt(4); out.write("test".getBytes(StandardCharsets.US_ASCII)); out.flush();
                     byte[] format = new byte[20]; in.readFully(format);
+                    assertEquals(16, format[4]); // default fast color RGB565
                     byte[] encodings = new byte[24]; in.readFully(encodings);
                     assertFalse(readUpdateRequestIncremental(in));
 
@@ -212,6 +220,7 @@ public class RfbClientProtocolTest {
                 @Override public void onDisconnected() { }
                 @Override public void onDiagnostic(String message) { }
             });
+            client.setFastColor(false); // This mock deliberately sends 32bpp Raw and zlib pixels.
             Future<?> clientFuture = threads.submit(client::runBlocking);
             try {
                 assertTrue("RFB frame was not received", frameReceived.await(10, TimeUnit.SECONDS));

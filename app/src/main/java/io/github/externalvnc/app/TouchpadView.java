@@ -21,6 +21,7 @@ public final class TouchpadView extends View {
     }
 
     private RfbClient client;
+    private float mouseSpeed = 2f;
     private InputListener inputListener;
     private CaptureListener captureListener;
     private boolean hoverKnown;
@@ -37,6 +38,7 @@ public final class TouchpadView extends View {
     }
 
     public void setClient(RfbClient client) { this.client = client; }
+    public void setMouseSpeed(float mouseSpeed) { this.mouseSpeed = mouseSpeed; }
     public void setInputListener(InputListener listener) { inputListener = listener; }
     public void setCaptureListener(CaptureListener listener) { captureListener = listener; }
 
@@ -46,7 +48,14 @@ public final class TouchpadView extends View {
     }
 
     private void emitMove(float dx, float dy) {
-        if (client != null) client.sendRelativeMove(dx * 1.8f, dy * 1.8f);
+        if (client != null) {
+            // The full touchpad width/height corresponds to the full remote screen.
+            // A fixed 1.8x multiplier never preserved that proportional mapping.
+            float scaleX = client.getFramebufferWidth() / (float) Math.max(1, getWidth());
+            float scaleY = client.getFramebufferHeight() / (float) Math.max(1, getHeight());
+            client.sendRelativeMove(dx * scaleX * mouseSpeed,
+                    dy * scaleY * mouseSpeed);
+        }
         if (inputListener != null) inputListener.onMove(dx, dy);
     }
 
