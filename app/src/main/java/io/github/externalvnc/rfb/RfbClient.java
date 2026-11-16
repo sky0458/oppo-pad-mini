@@ -8,40 +8,49 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.crypto.Cipher;
 import javax.crypto.spec.SecretKeySpec;
 
 /**
  * Minimal pure-Java open-source RFB/VNC client (RFC 6143).
- * Security: VncAuth/None only. Encodings: Raw, CopyRect, DesktopSize.
- * No TLS, Tight or proprietary Apple Remote Desktop authentication.
+ * Security: VncAuth/None/Apple DH (type 30). Encodings: Raw, CopyRect, DesktopSize.
+ * No TLS or session-wide encryption; use a trusted encrypted tunnel.
  */
 public final class RfbClient implements AutoCloseable {
+    public enum AuthMode { AUTO, MAC_ACCOUNT, MAC_CBC_COMPAT, VNC_PASSWORD }
+
     public interface Listener {
         void onConnected(String desktopName, int width, int height);
         /** Frame pixels are reused by the reader thread; copy before asynchronous processing. */
         void onFrame(int width, int height, int[] pixels);
         void onError(String error);
         void onDisconnected();
+        void onDiagnostic(String message);
     }
 
     private static final int MAX_PIXELS = 16_777_216;
-    private final String host, password;
+    private final String host, username, password;
+    private final AuthMode authMode;
     private final int port;
     private final Listener listener;
     private final Object writeLock = new Object();
     private final AtomicBoolean active = new AtomicBoolean();
+    private final AtomicBoolean ready = new AtomicBoolean();
     private volatile Socket socket;
     private volatile DataOutputStream output;
     private volatile int width, height, cursorX, cursorY;
     private volatile int buttonMask;
     private int[] pixels;
 
-    public RfbClient(String host, int port, String password, Listener listener) {
+    public RfbClient(String host, int port, String username, String password,
+                     AuthMode authMode, Listener listener) {
         this.host = host;
         this.port = port;
+        this.username = username == null ? "" : username;
         this.password = password == null ? "" : password;
+        this.authMode = authMode;
         this.listener = listener;
     }
 
@@ -52,9 +61,11 @@ public final class RfbClient implements AutoCloseable {
             socket = connection;
             connection.connect(new InetSocketAddress(host, port), 8000);
             connection.setTcpNoDelay(true);
+            connection.setSoTimeout(15000); // Avoid hanging forever during authentication.
             DataInputStream in = new DataInputStream(new BufferedInputStream(connection.getInputStream(), 65536));
             output = new DataOutputStream(new BufferedOutputStream(connection.getOutputStream(), 65536));
             negotiate(in);
+            connection.setSoTimeout(0);
             while (active.get()) {
                 int kind = in.readUnsignedByte();
                 switch (kind) {
@@ -79,7 +90,10 @@ public final class RfbClient implements AutoCloseable {
                 }
             }
         } catch (Exception ex) {
-            if (active.get()) listener.onError(ex.getClass().getSimpleName() + ": " + ex.getMessage());
+            if (active.get()) {
+                listener.onDiagnostic("ERROR " + ex.getClass().getSimpleName() + ": " + ex.getMessage());
+                listener.onError(ex.getClass().getSimpleName() + ": " + ex.getMessage());
+            }
         } finally {
             close();
             listener.onDisconnected();
@@ -94,25 +108,43 @@ public final class RfbClient implements AutoCloseable {
             throw new IOException("Unexpected RFB greeting: " + protocol);
         int remoteMinor = Integer.parseInt(protocol.substring(8, 11));
         int minor = remoteMinor >= 8 ? 8 : remoteMinor >= 7 ? 7 : 3;
+        listener.onDiagnostic("RFB greeting=" + protocol.trim() + " negotiated=3." + minor);
         write(String.format(java.util.Locale.ROOT, "RFB 003.%03d\n", minor)
                 .getBytes(StandardCharsets.US_ASCII));
 
         int security;
         if (minor == 3) {
             security = in.readInt();
+            listener.onDiagnostic("RFB 3.3 server security=" + security);
             if (security == 0) throw new IOException(readReason(in));
         } else {
             int count = in.readUnsignedByte();
             if (count == 0) throw new IOException(readReason(in));
-            boolean allowNone = false, allowVnc = false;
+            if (count > 64) throw new IOException("Invalid security type count=" + count);
+            int[] offeredTypes = new int[count];
+            boolean allowNone = false, allowVnc = false, allowMac = false;
             for (int i = 0; i < count; i++) {
                 int offered = in.readUnsignedByte();
+                offeredTypes[i] = offered;
                 if (offered == 1) allowNone = true;
                 if (offered == 2) allowVnc = true;
+                if (offered == 30) allowMac = true;
             }
-            if (!password.isEmpty() && allowVnc) security = 2;
-            else if (password.isEmpty() && allowNone) security = 1;
-            else throw new IOException("Server requires unsupported authentication. Enable a separate VNC password in macOS Screen Sharing.");
+            listener.onDiagnostic("Server security types=" + Arrays.toString(offeredTypes));
+            if (authMode == AuthMode.VNC_PASSWORD) {
+                if (!allowVnc) throw new IOException("Mac 未提供 VNC 专用密码认证 (2)，请改选 Mac 账号密码 (30)");
+                security = 2;
+            } else if (authMode == AuthMode.MAC_ACCOUNT || authMode == AuthMode.MAC_CBC_COMPAT) {
+                if (!allowMac) throw new IOException("服务器未提供 Mac 账号认证 (30)；可尝试 VNC 专用密码认证");
+                security = 30;
+            } else if (!username.isEmpty() && allowMac) security = 30;
+            else if (!password.isEmpty() && allowVnc) security = 2;
+            else if (username.isEmpty() && password.isEmpty() && allowNone) security = 1;
+            else if (allowMac && username.isEmpty())
+                throw new IOException("Mac 提供账号认证 (30)：请填写 Mac 本地用户名及登录密码");
+            else throw new IOException("无兼容认证方式；服务端提供 " + Arrays.toString(offeredTypes));
+            listener.onDiagnostic("Selected security type=" + security
+                    + (security == 30 ? (authMode == AuthMode.MAC_CBC_COMPAT ? " (AES-CBC)" : " (AES-ECB)") : ""));
             synchronized (writeLock) { output.writeByte(security); output.flush(); }
         }
         if (security == 2) {
@@ -120,14 +152,18 @@ public final class RfbClient implements AutoCloseable {
             byte[] challenge = new byte[16];
             in.readFully(challenge);
             write(encryptChallenge(challenge, password));
+        } else if (security == 30) {
+            AppleDhAuth.authenticate(in, output, username, password,
+                    authMode == AuthMode.MAC_CBC_COMPAT);
         } else if (security != 1) {
             throw new IOException("Unsupported RFB SecurityType " + security);
         }
-        // SecurityResult is mandatory for VncAuth, and for all RFB 3.8 security types.
-        if (security == 2 || minor == 8) {
+        // SecurityResult is mandatory for authenticated types and RFB 3.8.
+        if (security == 2 || security == 30 || minor == 8) {
             int result = in.readInt();
+            listener.onDiagnostic("SecurityResult=" + result);
             if (result != 0) {
-                throw new IOException(minor >= 8 ? readReason(in) : "VNC password rejected");
+                throw new IOException(minor >= 8 ? readReason(in) : "VNC authentication rejected (" + result + ")");
             }
         }
 
@@ -142,6 +178,8 @@ public final class RfbClient implements AutoCloseable {
         resize(fbW, fbH);
         setPixelFormat();
         setEncodings();
+        ready.set(true);
+        listener.onDiagnostic("ServerInit desktop=" + width + "x" + height + " (connected)");
         listener.onConnected(new String(name, StandardCharsets.UTF_8), width, height);
         requestUpdate(false);
     }
@@ -255,7 +293,7 @@ public final class RfbClient implements AutoCloseable {
 
     public void sendPointer(int x, int y, int buttons) {
         DataOutputStream stream = output;
-        if (!active.get() || stream == null || width == 0 || height == 0) return;
+        if (!active.get() || !ready.get() || stream == null || width == 0 || height == 0) return;
         cursorX = Math.max(0, Math.min(width - 1, x));
         cursorY = Math.max(0, Math.min(height - 1, y));
         try {
@@ -287,7 +325,7 @@ public final class RfbClient implements AutoCloseable {
 
     public void sendKey(int keysym, boolean pressed) {
         DataOutputStream stream = output;
-        if (!active.get() || stream == null || keysym == 0) return;
+        if (!active.get() || !ready.get() || stream == null || keysym == 0) return;
         try {
             synchronized (writeLock) {
                 stream.writeByte(4);
@@ -301,6 +339,7 @@ public final class RfbClient implements AutoCloseable {
 
     @Override public void close() {
         active.set(false);
+        ready.set(false);
         Socket s = socket; socket = null;
         if (s != null) try { s.close(); } catch (IOException ignored) { }
     }

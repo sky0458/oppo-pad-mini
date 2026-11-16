@@ -26,12 +26,25 @@ Android 平板外接 HDMI 显示器时，使用 Android Presentation API 在**�
 
 ## 如何运行
 
-1. 在 macOS 设置 -> 通用 -> 共享 -> 屏幕共享中开启 VNC 服务，并启用“VNC 显示程序可以使用密码控制屏幕”。使用专门的 VNC 密码，而不是 Apple ID 或 macOS 用户登录密码。
+1. 在 macOS **系统设置 → 通用 → 共享 → 屏幕共享** 中开启共享，并允许当前 Mac 用户访问。默认可使用 Mac 本地账号认证；不必额外开启旧版 VNC 专用密码。
 2. 平板与 Mac 位于同一局域网，或通过 ZeroTier 互通。**不要在公网直接开放 TCP 5900**。
 3. 使用 Android Studio（JDK 17）打开本仓库，构建并安装 app，或下载 GitHub Actions 生成的 debug APK。
 4. 将平板接入 HDMI 显示器，选择外部 Display，先按“测试外屏”。
 5. **只有 HDMI 上出现 Presentation OK 测试文字**，才说明 ColorOS 在这台设备上允许独立输出。如果仍然只有镜像或 Presentation 失败，应用无法绕过固件的显示限制。
-6. 输入 Mac 的 IP、端口 5900、VNC 专用密码，按“连接 VNC”。
+6. 输入 Mac IP、端口 5900，填写 **Mac 本地短用户名 + Mac 登录密码**，认证选“Mac 账号密码”或“认证：自动”，按“连接 VNC”。可在 Mac 终端用 `id -un` 确认短用户名（不是 Apple ID 邮箱）。如果已经在 macOS 单独设置了“VNC 显示程序可以使用密码控制屏幕”，可以改选“VNC 专用密码”，用户名留空。
+
+## 密码认证及诊断（v0.2.0）
+
+| 认证选择 | 服务端类型 | 填写方式 |
+| --- | --- | --- |
+| 认证：自动 | 优先 30（已填写用户名），否则 2 | Mac 用户名 + 登录密码，或只填 VNC 专用密码 |
+| Mac 账号密码 | Apple DH / 30，AES-ECB | Mac 短用户名 + Mac 登录密码 |
+| Mac 账号（CBC兼容） | Apple DH / 30，AES-CBC | Mac 短用户名 + Mac 登录密码；仅供与特定新系统兼容性测试 |
+| VNC 专用密码 | 标准 VNC / 2，DES | macOS 单独配置的 VNC 密码；仅前 8 字节有效 |
+
+如果仍无法认证，优先点击 **“查看日志” → “复制日志”**，或 **“导出日志”**，选择 Android 文件管理器中的保存位置，生成 `oppo-pad-mini-vnc-日期.log`。日志记录协议版本、服务器通告的认证类型（如 `[30, 33, 36, 35]`）、选择的认证方式、认证结果、屏幕大小、网络错误和连接操作，保留最近三个文件，总量约 1.5 MiB。**用户名和密码不写入日志，IPv4 地址最后一段自动隐藏**；导出前仍应检查日志是否包含其他私人信息。文件在应用私有目录内持久保存，不需要存储权限，也不会自动上传。
+
+注意：Mac 账号认证（30）仅加密认证凭据，**不是全程端到端加密**；不要把 TCP 5900 暴露到公网，建议走 ZeroTier、WireGuard 等可信加密网络。部分新 macOS 版本可能只开放 33 / 35 / 36 等认证，仍需后续实现；CBC 兼容模式也不能保证适用于所有 Mac。外接显示器画面还需要在实机上确认。
 
 ## 技术结构
 
@@ -42,15 +55,16 @@ Android 平板外接 HDMI 显示器时，使用 Android Presentation API 在**�
 
 ## 当前支持
 
-- VNC 密码验证 (RFB SecurityType 2)
+- VNC 密码验证 (RFB SecurityType 2) 和 Mac 本地账号密码认证 (RFB SecurityType 30)
+- 本地日志自动保存（大小上限、轮转），查看、复制、导出 `.log` 文件
 - Raw、CopyRect、DesktopSize 编码
 - 触控板左键点击、滚轮、键盘按键和鼠标指针捕获
 - 外屏缩放：适应、裁切铺满、拉伸铺满
-- 不保存 VNC 密码；保存主机和端口
+- 不保存任何密码；保存主机和端口；日志不记录用户名/密码
 
 ## 当前不支持 / 已知限制
 
-- **不支持** Apple Remote Desktop 专有用户名/密码认证；需要在 Mac 启用 VNC 独立密码。
+- **不支持** Apple Remote Desktop 其他认证类型 33 / 35 / 36（RSA-SRP / Kerberos / SRP）；仅实现 30（DH），需 Mac 实机验证。
 - **不支持** TLS / VeNCrypt / SSH 隧道。RFB 认证并不代表画面/输入通道加密，请只在可信局域网或 ZeroTier 等加密内网中使用。
 - **暂不支持** Tight / ZRLE / H.264 压缩：Raw 对带宽敏感，高分辨率和高帧率下性能有限。这一版本以验证 ColorOS 外屏能力为先。
 - VNC 服务端输出比例和外屏比例不同，适应模式仍可能出现黑边；可以切换裁切或拉伸，但这不是远程桌面分辨率自动协商。
@@ -60,6 +74,7 @@ Android 平板外接 HDMI 显示器时，使用 Android Presentation API 在**�
 
 - Android [Presentation API](https://developer.android.com/reference/android/app/Presentation)
 - [RFC 6143: Remote Framebuffer Protocol](https://www.rfc-editor.org/rfc/rfc6143)
+- [RFB 扩展规范：Diffie-Hellman Authentication (30)](https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst)
 - [AVNC](https://github.com/gujjwal00/avnc)（成熟客户端，可作为后续 LibVNCClient/TLS 接入参考）
 - [DroidVM](https://github.com/Droid-VM/DroidVM)（开源项目中已存在 VNC + Presentation 多屏实现可供研究；本仓库未复制其 GPL 源码）
 

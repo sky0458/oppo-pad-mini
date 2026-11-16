@@ -1,8 +1,13 @@
 package io.github.externalvnc.app;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Intent;
 import android.graphics.Color;
 import android.hardware.display.DisplayManager;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -17,12 +22,18 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.Spinner;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.IOException;
+import java.io.OutputStream;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -34,14 +45,18 @@ import io.github.externalvnc.rfb.RfbClient;
  * External HDMI display: Presentation-owned independent VNC framebuffer.
  */
 public final class MainActivity extends Activity implements DisplayManager.DisplayListener {
+    private static final int REQUEST_EXPORT_LOG = 1001;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicBoolean framePending = new AtomicBoolean();
+    private final AtomicBoolean firstFrameLogged = new AtomicBoolean();
     private final List<Display> displays = new ArrayList<>();
 
     private DisplayManager displayManager;
     private Spinner displaySelector;
-    private EditText hostField, portField, passwordField;
+    private Spinner authSelector;
+    private EditText hostField, portField, usernameField, passwordField;
+    private AppLog diagnostics;
     private TextView statusLabel;
     private Button connectButton, scaleButton, captureButton;
     private TouchpadView touchpad;
@@ -55,6 +70,8 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
 
     @Override public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        diagnostics = new AppLog(this);
+        diagnostics.add("APP", "Application started; logs are saved locally and credentials are never logged");
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         displayManager = (DisplayManager) getSystemService(DISPLAY_SERVICE);
         displayManager.registerDisplayListener(this, ui);
@@ -81,8 +98,24 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         LinearLayout credentials = row(layout);
         hostField = textField(credentials, "Mac IP / ZeroTier IP", "", InputType.TYPE_CLASS_TEXT, 2.5f);
         portField = textField(credentials, "端口", "5900", InputType.TYPE_CLASS_NUMBER, .7f);
-        passwordField = textField(credentials, "VNC 专用密码", "",
+        passwordField = textField(credentials, "密码", "",
                 InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD, 1.5f);
+
+        LinearLayout authRow = row(layout);
+        usernameField = textField(authRow, "Mac 本地用户名（账号认证必填）", "", InputType.TYPE_CLASS_TEXT, 1.5f);
+        authSelector = new Spinner(this);
+        ArrayAdapter<String> authenticationOptions = new ArrayAdapter<String>(this,
+                android.R.layout.simple_spinner_item,
+                new String[]{"认证：自动", "Mac 账号密码", "Mac 账号（CBC兼容）", "VNC 专用密码"}) {
+            @Override public View getView(int position, View convertView, android.view.ViewGroup parent) {
+                TextView view = (TextView) super.getView(position, convertView, parent);
+                view.setTextColor(Color.WHITE);
+                return view;
+            }
+        };
+        authenticationOptions.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        authSelector.setAdapter(authenticationOptions);
+        authRow.addView(authSelector, new LinearLayout.LayoutParams(0, dp(48), 1.4f));
 
         LinearLayout monitorRow = row(layout);
         displaySelector = new Spinner(this);
@@ -120,6 +153,15 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                 + "点击“抓取鼠标”可尝试捕获硬件鼠标；点击触控板使硬件键盘获得焦点。", 12);
         hint.setTextColor(0xffb9c6d4);
         layout.addView(hint);
+
+        LinearLayout logRow = row(layout);
+        Button viewLogButton = button(logRow, "查看日志", 1f);
+        viewLogButton.setOnClickListener(v -> showLogs());
+        Button copyLogButton = button(logRow, "复制日志", 1f);
+        copyLogButton.setOnClickListener(v -> copyLogs());
+        Button exportLogButton = button(logRow, "导出日志", 1f);
+        exportLogButton.setOnClickListener(v -> requestExportLogs());
+
         touchpad = new TouchpadView(this);
         touchpad.setInputListener(new TouchpadView.InputListener() {
             @Override public void onMove(float dx, float dy) {
@@ -134,6 +176,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         });
         touchpad.setCaptureListener(hasCapture -> {
             captured = hasCapture;
+            diagnostics.add("INPUT", "Pointer capture=" + hasCapture);
             captureButton.setText(hasCapture ? "释放鼠标" : "抓取鼠标");
             if (inputTestPresentation != null) {
                 inputTestPresentation.captured(hasCapture);
@@ -193,6 +236,58 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
 
     private void status(String message) {
         statusLabel.setText(message);
+        diagnostics.add("UI", message);
+    }
+
+    private void showLogs() {
+        try {
+            TextView contents = label(diagnostics.recent(65000), 12);
+            contents.setTextIsSelectable(true);
+            contents.setTextColor(0xff243448);
+            ScrollView scroll = new ScrollView(this);
+            scroll.addView(contents);
+            new AlertDialog.Builder(this).setTitle("诊断日志（最近 65K 字符）")
+                    .setView(scroll).setPositiveButton("关闭", null)
+                    .setNeutralButton("复制", (dialog, which) -> copyLogs()).show();
+        } catch (IOException error) {
+            status("查看日志失败：" + error.getMessage());
+        }
+    }
+
+    private void copyLogs() {
+        try {
+            String content = diagnostics.recent(128000);
+            ClipboardManager manager = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            manager.setPrimaryClip(ClipData.newPlainText("External VNC diagnostics", content));
+            Toast.makeText(this, "已复制日志（最多最近 128K 字符）", Toast.LENGTH_SHORT).show();
+            diagnostics.add("LOG", "Diagnostic log copied to clipboard");
+        } catch (IOException error) {
+            status("复制日志失败：" + error.getMessage());
+        }
+    }
+
+    private void requestExportLogs() {
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("text/plain");
+        String name = new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(new Date());
+        intent.putExtra(Intent.EXTRA_TITLE, "oppo-pad-mini-vnc-" + name + ".log");
+        diagnostics.add("LOG", "Export requested via Android document picker");
+        startActivityForResult(intent, REQUEST_EXPORT_LOG);
+    }
+
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQUEST_EXPORT_LOG || resultCode != RESULT_OK || data == null) return;
+        Uri uri = data.getData();
+        if (uri == null) return;
+        try (OutputStream destination = getContentResolver().openOutputStream(uri)) {
+            if (destination == null) throw new IOException("Unable to open destination");
+            diagnostics.exportTo(destination);
+            status("诊断日志已导出至选定位置（包含最近三个轮转日志）");
+        } catch (IOException error) {
+            status("日志导出失败：" + error.getMessage());
+        }
     }
 
     /** We want an external physical display, not a secondary Activity on the primary one. */
@@ -222,6 +317,8 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         int selected = displaySelector.getSelectedItemPosition();
         if (selected < 0 || selected >= displays.size()) return false;
         Display target = displays.get(selected);
+        diagnostics.add("DISPLAY", "Opening Presentation display #" + target.getDisplayId()
+                + ", mode=" + target.getMode().getPhysicalWidth() + "x" + target.getMode().getPhysicalHeight());
         if (inputTestPresentation != null) closeInputTest();
         if (presentation != null
                 && presentation.getDisplay().getDisplayId() == target.getDisplayId()) return true;
@@ -279,6 +376,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         if (!openPresentation()) return;
         String host = hostField.getText().toString().trim();
         String portString = portField.getText().toString().trim();
+        String username = usernameField.getText().toString().trim();
         String password = passwordField.getText().toString();
         if (host.isEmpty()) { status("请填写 Mac 的局域网 IP。"); return; }
         final int port;
@@ -289,14 +387,32 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
             status("端口应在 1–65535 之间，通常为 5900。");
             return;
         }
+
+        RfbClient.AuthMode mode = new RfbClient.AuthMode[]{RfbClient.AuthMode.AUTO,
+                RfbClient.AuthMode.MAC_ACCOUNT, RfbClient.AuthMode.MAC_CBC_COMPAT,
+                RfbClient.AuthMode.VNC_PASSWORD}[authSelector.getSelectedItemPosition()];
+        if ((mode == RfbClient.AuthMode.MAC_ACCOUNT || mode == RfbClient.AuthMode.MAC_CBC_COMPAT)
+                && username.isEmpty()) {
+            status("Mac 账号认证请填写本地用户名（不是 Apple ID 邮箱）。");
+            return;
+        }
+        if (password.isEmpty() && mode != RfbClient.AuthMode.AUTO) {
+            status("请填写密码；Mac 账号认证使用 Mac 登录密码。");
+            return;
+        }
         // Password intentionally never persisted.
         getPreferences(MODE_PRIVATE).edit()
                 .putString("host", host)
                 .putString("port", portString)
                 .apply();
 
+        diagnostics.add("CONNECT", "Starting VNC connection port=" + port
+                + " auth=" + mode + " usernameProvided=" + !username.isEmpty()
+                + " passwordProvided=" + !password.isEmpty());
+
         final RfbClient[] holder = new RfbClient[1];
-        RfbClient session = new RfbClient(host, port, password, new RfbClient.Listener() {
+        firstFrameLogged.set(false);
+        RfbClient session = new RfbClient(host, port, username, password, mode, new RfbClient.Listener() {
             @Override public void onConnected(String desktop, int width, int height) {
                 ui.post(() -> {
                     if (currentClient != holder[0]) return;
@@ -306,6 +422,8 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
             }
 
             @Override public void onFrame(int width, int height, int[] pixels) {
+                if (firstFrameLogged.compareAndSet(false, true))
+                    diagnostics.add("FRAME", "First framebuffer update " + width + "x" + height);
                 if (!framePending.compareAndSet(false, true)) return;
                 int[] copy = Arrays.copyOf(pixels, pixels.length);
                 ui.post(() -> {
@@ -325,12 +443,17 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
             }
 
             @Override public void onDisconnected() {
+                diagnostics.add("CONNECT", "RFB session ended");
                 ui.post(() -> {
                     if (currentClient != holder[0]) return;
                     currentClient = null;
                     touchpad.setClient(null);
                     connectButton.setText("连接 VNC");
                 });
+            }
+
+            @Override public void onDiagnostic(String message) {
+                diagnostics.add("RFB", message);
             }
         });
 
@@ -343,6 +466,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     }
 
     private void disconnect() {
+        diagnostics.add("CONNECT", "Disconnect requested by app");
         RfbClient session = currentClient;
         currentClient = null;
         if (session != null) session.close();
