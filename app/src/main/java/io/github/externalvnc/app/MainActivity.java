@@ -159,6 +159,15 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                     : "VNC 尚未完成初始化，或连接已经断开。");
         });
 
+        Button patternButton = button(actionRow, "HDMI 彩条", .8f);
+        patternButton.setOnClickListener(v -> {
+            if (!openPresentation()) return;
+            boolean showing = presentation.toggleDiagnosticPattern();
+            patternButton.setText(showing ? "退出彩条" : "HDMI 彩条");
+            status(showing ? "已显示 HDMI 彩条：红、绿、蓝、白，与 VNC 像素无关。"
+                    : "已恢复 VNC 画面显示。");
+        });
+
         LinearLayout inputRow = row(layout);
         inputTestButton = button(inputRow, "键鼠测试（不连接VNC）", 1.6f);
         inputTestButton.setOnClickListener(v -> {

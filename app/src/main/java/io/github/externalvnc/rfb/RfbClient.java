@@ -9,6 +9,9 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.crypto.Cipher;
 import javax.crypto.spec.SecretKeySpec;
@@ -38,6 +41,14 @@ public final class RfbClient implements AutoCloseable {
     private final Object writeLock = new Object();
     private final AtomicBoolean active = new AtomicBoolean();
     private final AtomicBoolean ready = new AtomicBoolean();
+    private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicBoolean motionQueued = new AtomicBoolean();
+    /** Every interactive write runs here, never on Android's main thread. */
+    private final ExecutorService outbound = Executors.newSingleThreadExecutor(task -> {
+        Thread thread = new Thread(task, "rfb-outbound");
+        thread.setDaemon(true);
+        return thread;
+    });
     private volatile Socket socket;
     private volatile DataOutputStream output;
     private volatile int width, height, cursorX, cursorY;
@@ -56,7 +67,9 @@ public final class RfbClient implements AutoCloseable {
     }
 
     public void runBlocking() {
+        if (closed.get()) return;
         if (!active.compareAndSet(false, true)) return;
+        if (closed.get()) { active.set(false); return; }
         try {
             Socket connection = new Socket();
             socket = connection;
@@ -181,6 +194,15 @@ public final class RfbClient implements AutoCloseable {
         resize(fbW, fbH);
         setPixelFormat();
         setEncodings();
+        if (security == 30) {
+            // macOS defaults third-party viewers to observe-only. SetMode requests
+            // input control; without this message mouse/keyboard events are ignored.
+            synchronized (writeLock) {
+                output.write(new byte[]{10, 0, 0, 1});
+                output.flush();
+            }
+            listener.onDiagnostic("Apple SetMode control request sent (0a 00 00 01)");
+        }
         ready.set(true);
         listener.onDiagnostic("ServerInit desktop=" + width + "x" + height + " (connected)");
         listener.onConnected(new String(name, StandardCharsets.UTF_8), width, height);
@@ -197,6 +219,7 @@ public final class RfbClient implements AutoCloseable {
             output.write(new byte[3]);
             output.flush();
         }
+        listener.onDiagnostic("Requested pixel format: 32bpp depth24 littleEndian RGB888 shifts=16,8,0");
     }
 
     private void setEncodings() throws IOException {
@@ -218,16 +241,10 @@ public final class RfbClient implements AutoCloseable {
 
     /** Manually request a full screen update if the server sent a blank/incomplete frame. */
     public boolean requestFullRefresh() {
-        if (!active.get() || !ready.get()) return false;
-        try {
+        return enqueueOutbound(() -> {
             requestUpdate(false);
             listener.onDiagnostic("Manual non-incremental framebuffer refresh requested");
-            return true;
-        } catch (IOException error) {
-            listener.onDiagnostic("Manual refresh failed: " + error.getMessage());
-            close();
-            return false;
-        }
+        });
     }
 
     private void resize(int w, int h) throws IOException {
@@ -243,7 +260,7 @@ public final class RfbClient implements AutoCloseable {
         in.readUnsignedByte(); // pad
         int count = in.readUnsignedShort();
         int rawRects = 0, copyRects = 0, resizeRects = 0;
-        long rawPixels = 0;
+        long rawPixels = 0, nonBlackRawPixels = 0, nonZeroPaddingBytes = 0;
         for (int i = 0; i < count; i++) {
             int x = in.readUnsignedShort(), y = in.readUnsignedShort();
             int w = in.readUnsignedShort(), h = in.readUnsignedShort();
@@ -265,6 +282,8 @@ public final class RfbClient implements AutoCloseable {
                     int at = (y + row) * width + x;
                     for (int col = 0, p = 0; col < w; col++, p += 4) {
                         int blue = line[p] & 255, green = line[p + 1] & 255, red = line[p + 2] & 255;
+                        if ((blue | green | red) != 0) nonBlackRawPixels++;
+                        if (line[p + 3] != 0) nonZeroPaddingBytes++;
                         pixels[at + col] = 0xff000000 | (red << 16) | (green << 8) | blue;
                     }
                 }
@@ -284,7 +303,8 @@ public final class RfbClient implements AutoCloseable {
         if (framebufferUpdates <= 8 || framebufferUpdates % 60 == 0 || resizeRects > 0)
             listener.onDiagnostic("FramebufferUpdate #" + framebufferUpdates + " rects=" + count
                     + " raw=" + rawRects + " copy=" + copyRects + " desktopSize=" + resizeRects
-                    + " rawPixels=" + rawPixels + " size=" + width + "x" + height);
+                    + " rawPixels=" + rawPixels + " nonBlackWire=" + nonBlackRawPixels
+                    + " nonZero4thByte=" + nonZeroPaddingBytes + " size=" + width + "x" + height);
         if (rawRects > 0 || copyRects > 0) listener.onFrame(width, height, pixels);
         return resizeRects > 0;
     }
@@ -322,20 +342,48 @@ public final class RfbClient implements AutoCloseable {
         synchronized (writeLock) { output.write(data); output.flush(); }
     }
 
+    @FunctionalInterface private interface OutboundTask {
+        void run() throws IOException;
+    }
+
+    /** Queue a network write without blocking Android's UI or pointer-input callbacks. */
+    private boolean enqueueOutbound(OutboundTask task) {
+        if (!active.get() || !ready.get()) return false;
+        try {
+            outbound.execute(() -> {
+                if (!active.get() || !ready.get()) return;
+                try {
+                    task.run();
+                } catch (IOException error) {
+                    listener.onDiagnostic("Outbound IO error: " + error);
+                    listener.onError("VNC 发送失败：" + error.getMessage());
+                    close();
+                }
+            });
+            return true;
+        } catch (RejectedExecutionException ignored) {
+            return false;
+        }
+    }
+
+    /** Must run on the outbound worker; called only by enqueueOutbound tasks. */
+    private void writePointer(int x, int y, int buttons) throws IOException {
+        synchronized (writeLock) {
+            if (!ready.get() || output == null) return;
+            output.writeByte(5);
+            output.writeByte(buttons);
+            output.writeShort(x);
+            output.writeShort(y);
+            output.flush();
+        }
+    }
+
     public void sendPointer(int x, int y, int buttons) {
-        DataOutputStream stream = output;
-        if (!active.get() || !ready.get() || stream == null || width == 0 || height == 0) return;
+        if (!ready.get() || width == 0 || height == 0) return;
         cursorX = Math.max(0, Math.min(width - 1, x));
         cursorY = Math.max(0, Math.min(height - 1, y));
-        try {
-            synchronized (writeLock) {
-                stream.writeByte(5);
-                stream.writeByte(buttons);
-                stream.writeShort(cursorX);
-                stream.writeShort(cursorY);
-                stream.flush();
-            }
-        } catch (IOException e) { close(); }
+        final int atX = cursorX, atY = cursorY;
+        enqueueOutbound(() -> writePointer(atX, atY, buttons));
     }
 
     public void setButtons(int buttons) {
@@ -343,34 +391,57 @@ public final class RfbClient implements AutoCloseable {
         sendPointer(cursorX, cursorY, buttons);
     }
 
+    /** Mouse motion is coalesced so that fast hardware mice cannot create an unbounded queue. */
     public void sendRelativeMove(float dx, float dy) {
-        sendPointer(cursorX + Math.round(dx), cursorY + Math.round(dy), buttonMask);
+        if (!ready.get() || width == 0 || height == 0) return;
+        cursorX = Math.max(0, Math.min(width - 1, cursorX + Math.round(dx)));
+        cursorY = Math.max(0, Math.min(height - 1, cursorY + Math.round(dy)));
+        scheduleLatestMotion();
+    }
+
+    private void scheduleLatestMotion() {
+        if (!motionQueued.compareAndSet(false, true)) return;
+        if (!enqueueOutbound(() -> {
+            final int atX = cursorX, atY = cursorY, mask = buttonMask;
+            try {
+                writePointer(atX, atY, mask);
+            } finally {
+                motionQueued.set(false);
+                if (atX != cursorX || atY != cursorY || mask != buttonMask)
+                    scheduleLatestMotion();
+            }
+        })) motionQueued.set(false);
     }
 
     public void click(int button) {
-        sendPointer(cursorX, cursorY, buttonMask | button);
-        sendPointer(cursorX, cursorY, buttonMask);
+        final int atX = cursorX, atY = cursorY, previousButtons = buttonMask;
+        enqueueOutbound(() -> {
+            writePointer(atX, atY, previousButtons | button);
+            writePointer(atX, atY, previousButtons);
+        });
     }
 
     public void scroll(boolean up) { click(up ? 8 : 16); }
 
     public void sendKey(int keysym, boolean pressed) {
-        DataOutputStream stream = output;
-        if (!active.get() || !ready.get() || stream == null || keysym == 0) return;
-        try {
+        if (keysym == 0) return;
+        enqueueOutbound(() -> {
             synchronized (writeLock) {
-                stream.writeByte(4);
-                stream.writeByte(pressed ? 1 : 0);
-                stream.writeShort(0);
-                stream.writeInt(keysym);
-                stream.flush();
+                if (!ready.get() || output == null) return;
+                output.writeByte(4);
+                output.writeByte(pressed ? 1 : 0);
+                output.writeShort(0);
+                output.writeInt(keysym);
+                output.flush();
             }
-        } catch (IOException e) { close(); }
+        });
     }
 
     @Override public void close() {
+        closed.set(true);
         active.set(false);
         ready.set(false);
+        outbound.shutdownNow();
         Socket s = socket; socket = null;
         if (s != null) try { s.close(); } catch (IOException ignored) { }
     }

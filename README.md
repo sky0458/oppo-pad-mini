@@ -58,6 +58,22 @@ Android 平板外接 HDMI 显示器时，使用 Android Presentation API 在**�
 
 该调试标记仅为定位当前 OPPO Pad Mini + ColorOS 的输出问题，后续稳定版将提供隐藏开关。
 
+## v0.4.0：修复闪退、Mac 控制权限与纯黑画面诊断
+
+- **修复严重闪退**：此前 `sendPointer()`、`sendKey()`、`requestFullRefresh()` 从 Android UI 主线程直接操作 Socket，触发 `NetworkOnMainThreadException`。现在全部交给独立的单线程发送器，并合并高频鼠标移动，避免无限排队；点击、滚轮及按键消息保持顺序。
+- **Mac 输入控制**：使用 Apple DH 认证（类型 30）时，发送 Apple `SetMode` 控制消息 `0a 00 00 01`。macOS 可能默认把第三方 VNC 客户端视为仅观察，拒绝鼠标和键盘消息。连接后第一次键盘输入建议稍等 2 秒。
+- **纯黑 Raw 帧定位**：日志增加 `nonBlackWire`（远端 Raw 数据中非黑 RGB 像素总数）和 `nonZero4thByte`（第四字节统计），用于判断到底是服务端传来的黑屏，还是客户端错误解码。
+- **外接屏排障**：点击新按钮 **“HDMI 彩条”**，外屏应该直接显示红、绿、蓝、白四条竖色带；此画面完全不依赖网络和 VNC。再次点击恢复 VNC 画面。
+
+### 推荐排查顺序
+
+1. VNC 连接成功后先点“HDMI 彩条”。若彩条不可见，即使日志显示 `RENDER First bitmap drawn`，也应优先检查 ColorOS 的外屏 Presention 是否真的处于可见层，以及 HDMI 设备配置。
+2. 若彩条可见但远程画面仍黑，检查导出日志里 `nonBlackWire`。若数值为 `0`，则 Mac 通过 RFB 实际发送了全黑 RGB 数据。可先确认 Mac 本地屏幕已解锁且亮屏，并使用另一款 VNC 客户端交叉验证服务端。
+3. 若 `nonBlackWire` 大于 `0` 且 HDMI 彩条可见，重点检查 Android 的像素格式、渲染和缩放。请把日志发回继续定位。
+4. 若仍闪退，看 `[CRASH]`；本次已消除已知的 `NetworkOnMainThreadException` 路径。
+
+不要为排查而直接强制结束 macOS `WindowServer`；那会中断当前图形会话并可能丢失未保存的工作。
+
 ## 技术结构
 
 - Android Java 17 / Gradle / minSdk 26

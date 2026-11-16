@@ -20,6 +20,7 @@ public final class RemoteFrameView extends View {
     private int framesApplied;
     private boolean firstViewDrawLogged;
     private boolean firstBitmapDrawLogged;
+    private boolean diagnosticPattern;
 
     public RemoteFrameView(Context context) {
         super(context);
@@ -38,6 +39,14 @@ public final class RemoteFrameView extends View {
 
     public void setDiagnosticListener(Consumer<String> callback) {
         diagnostic = callback;
+    }
+
+    /** Full-screen saturated pattern tests HDMI composition independently of VNC pixels. */
+    public boolean toggleDiagnosticPattern() {
+        diagnosticPattern = !diagnosticPattern;
+        log("External display diagnostic pattern=" + diagnosticPattern);
+        invalidate();
+        return diagnosticPattern;
     }
 
     public void setFrame(int width, int height, int[] pixels) {
@@ -60,6 +69,18 @@ public final class RemoteFrameView extends View {
                     + " hardwareAccelerated=" + canvas.isHardwareAccelerated());
         }
         canvas.drawColor(Color.BLACK);
+        if (diagnosticPattern) {
+            int[] colors = {0xffff3030, 0xff30ff30, 0xff3030ff, 0xffffffff};
+            for (int i = 0; i < colors.length; i++) {
+                paint.setColor(colors[i]);
+                canvas.drawRect(i * getWidth() / 4f, 0, (i + 1) * getWidth() / 4f,
+                        getHeight(), paint);
+            }
+            paint.setColor(Color.BLACK);
+            paint.setTextSize(72);
+            canvas.drawText("HDMI PATTERN TEST", 48, getHeight() / 2f, paint);
+            return;
+        }
         if (bitmap != null && !bitmap.isRecycled()) {
             float widthRatio = getWidth() / (float) bitmap.getWidth();
             float heightRatio = getHeight() / (float) bitmap.getHeight();

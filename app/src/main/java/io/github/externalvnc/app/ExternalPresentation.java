@@ -34,6 +34,10 @@ public final class ExternalPresentation extends Presentation {
         if (frameView != null) frameView.setDiagnosticListener(callback);
     }
 
+    public boolean toggleDiagnosticPattern() {
+        return frameView != null && frameView.toggleDiagnosticPattern();
+    }
+
     public void showMessage(String message) {
         if (frameView != null) frameView.setMessage(message);
     }

@@ -26,6 +26,7 @@ public class RfbClientProtocolTest {
         ExecutorService threads = Executors.newFixedThreadPool(2);
         try (ServerSocket server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
             CountDownLatch nextUpdateRequested = new CountDownLatch(1);
+            CountDownLatch inputEventsSeen = new CountDownLatch(1);
             Future<?> serverFuture = threads.submit(() -> {
                 try (Socket socket = server.accept()) {
                     socket.setSoTimeout(10000);
@@ -78,6 +79,15 @@ public class RfbClientProtocolTest {
                     out.flush();
                     assertTrue(readUpdateRequestIncremental(in)); // next frame can be incremental
                     nextUpdateRequested.countDown();
+                    assertPointer(in, 0, 2, 1); // coalesced mouse movement
+                    assertPointer(in, 1, 2, 1); // button down
+                    assertPointer(in, 0, 2, 1); // button up
+                    assertEquals(4, in.readUnsignedByte()); // KeyEvent
+                    assertEquals(1, in.readUnsignedByte());
+                    assertEquals(0, in.readUnsignedShort());
+                    assertEquals(0x0061, in.readInt());
+                    assertFalse(readUpdateRequestIncremental(in)); // manual refresh
+                    inputEventsSeen.countDown();
                     assertEquals(-1, in.read()); // wait until the client closes deliberately
                     return null;
                 }
@@ -111,6 +121,12 @@ public class RfbClientProtocolTest {
                 assertEquals(0xff112238, image[5]);
                 assertTrue("Next framebuffer request was not observed",
                         nextUpdateRequested.await(10, TimeUnit.SECONDS));
+                client.sendRelativeMove(1, 0);
+                client.click(1);
+                client.sendKey(0x0061, true);
+                assertTrue("Manual refresh must be queued", client.requestFullRefresh());
+                assertTrue("Async pointer, key and refresh messages were not delivered",
+                        inputEventsSeen.await(10, TimeUnit.SECONDS));
             } finally {
                 client.close();
                 clientFuture.get(10, TimeUnit.SECONDS);
@@ -133,5 +149,12 @@ public class RfbClientProtocolTest {
         in.readFully(request);
         assertEquals(3, request[0]);
         return request[1] != 0;
+    }
+
+    private static void assertPointer(DataInputStream in, int buttons, int x, int y) throws Exception {
+        assertEquals(5, in.readUnsignedByte());
+        assertEquals(buttons, in.readUnsignedByte());
+        assertEquals(x, in.readUnsignedShort());
+        assertEquals(y, in.readUnsignedShort());
     }
 }
