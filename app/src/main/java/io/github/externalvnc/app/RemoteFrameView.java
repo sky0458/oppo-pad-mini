@@ -8,12 +8,18 @@ import android.graphics.Paint;
 import android.graphics.RectF;
 import android.view.View;
 
+import java.util.function.Consumer;
+
 /** VNC framebuffer view owned by the external Presentation window. */
 public final class RemoteFrameView extends View {
     private final Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
     private Bitmap bitmap;
     private String message = "Presentation API OK";
     private int scaleMode; // 0 FIT, 1 CENTER_CROP, 2 STRETCH
+    private Consumer<String> diagnostic;
+    private int framesApplied;
+    private boolean firstViewDrawLogged;
+    private boolean firstBitmapDrawLogged;
 
     public RemoteFrameView(Context context) {
         super(context);
@@ -30,18 +36,29 @@ public final class RemoteFrameView extends View {
         invalidate();
     }
 
+    public void setDiagnosticListener(Consumer<String> callback) {
+        diagnostic = callback;
+    }
+
     public void setFrame(int width, int height, int[] pixels) {
         if (bitmap == null || bitmap.getWidth() != width || bitmap.getHeight() != height) {
             if (bitmap != null) bitmap.recycle();
             bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
         }
         bitmap.setPixels(pixels, 0, width, 0, 0, width, height);
+        framesApplied++;
+        if (framesApplied <= 3) log("Bitmap updated #" + framesApplied + " " + width + "x" + height);
         message = null;
         invalidate();
     }
 
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
+        if (!firstViewDrawLogged) {
+            firstViewDrawLogged = true;
+            log("Presentation view onDraw size=" + getWidth() + "x" + getHeight()
+                    + " hardwareAccelerated=" + canvas.isHardwareAccelerated());
+        }
         canvas.drawColor(Color.BLACK);
         if (bitmap != null && !bitmap.isRecycled()) {
             float widthRatio = getWidth() / (float) bitmap.getWidth();
@@ -54,14 +71,39 @@ public final class RemoteFrameView extends View {
             float left = (getWidth() - displayW) / 2f;
             float top = (getHeight() - displayH) / 2f;
             paint.setColor(Color.WHITE);
-            canvas.drawBitmap(bitmap, null, new RectF(left, top,
-                    left + displayW, top + displayH), paint);
+            try {
+                canvas.drawBitmap(bitmap, null, new RectF(left, top,
+                        left + displayW, top + displayH), paint);
+                if (!firstBitmapDrawLogged) {
+                    firstBitmapDrawLogged = true;
+                    log("First bitmap drawn; view=" + getWidth() + "x" + getHeight()
+                            + ", bitmap=" + bitmap.getWidth() + "x" + bitmap.getHeight());
+                }
+            } catch (RuntimeException error) {
+                log("Bitmap draw failed: " + error.getClass().getSimpleName() + " " + error.getMessage());
+                paint.setColor(Color.RED);
+                paint.setTextSize(36);
+                canvas.drawText("VNC bitmap render error - export logs", 24, getHeight() / 2f, paint);
+            }
         } else if (message != null) {
             paint.setColor(0xff80ebd0);
             paint.setTextSize(Math.max(24, getWidth() / 42f));
             canvas.drawText(message, Math.max(24, getWidth() * 0.05f),
                     getHeight() / 2f, paint);
         }
+        // Deliberately visible during hardware testing, even when the remote pixels are black.
+        if (framesApplied > 0 && bitmap != null && !bitmap.isRecycled()) {
+            paint.setColor(0xb9000000);
+            canvas.drawRect(0, 0, Math.min(getWidth(), 1050), 64, paint);
+            paint.setTextSize(30);
+            paint.setColor(0xff80ebd0);
+            canvas.drawText("HDMI VNC | frame " + framesApplied + " | "
+                            + bitmap.getWidth() + "x" + bitmap.getHeight(), 22, 44, paint);
+        }
+    }
+
+    private void log(String text) {
+        if (diagnostic != null) diagnostic.accept(text);
     }
 
     public void release() {

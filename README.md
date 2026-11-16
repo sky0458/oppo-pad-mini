@@ -46,6 +46,18 @@ Android 平板外接 HDMI 显示器时，使用 Android Presentation API 在**�
 
 注意：Mac 账号认证（30）仅加密认证凭据，**不是全程端到端加密**；不要把 TCP 5900 暴露到公网，建议走 ZeroTier、WireGuard 等可信加密网络。部分新 macOS 版本可能只开放 33 / 35 / 36 等认证，仍需后续实现；CBC 兼容模式也不能保证适用于所有 Mac。外接显示器画面还需要在实机上确认。
 
+## v0.3.0：连接成功但 HDMI 黑屏
+
+如果日志中有 `SecurityResult=0`、`ServerInit desktop=...`，说明认证成功，接下来要检查帧数据和显示：
+
+1. 重新连接 VNC；程序现在会在 `FramebufferUpdate` 中记录 Raw / CopyRect / DesktopSize 矩形数量。收到 DesktopSize 后会主动请求**非增量完整刷新**。
+2. HDMI 画面左上角将显示绿色 `HDMI VNC | frame N | ...` 调试标记。如果看得到该标记，但下面全黑，说明外屏已经渲染了位图，重点检查服务端画面；如果没有标记，查看日志中的 `RENDER`。
+3. 点击新按钮 **“远端重绘”**，手动强制请求完整画面。
+4. 查看日志中 `FRAME Received` 的 `nonBlack=x/y`：若为 0，表示抽样的像素全部为黑色；若大于 0，说明 Mac 已发送非黑色像素，继续检查 HDMI 渲染链路。`RENDER First bitmap drawn` 表示 Android View 已执行位图绘制。
+5. 程序会记录未捕获 Java 异常的堆栈至 `CRASH`，用于排查应用重启；OS 直接杀死进程（如严重内存不足）不保证能留下堆栈。
+
+该调试标记仅为定位当前 OPPO Pad Mini + ColorOS 的输出问题，后续稳定版将提供隐藏开关。
+
 ## 技术结构
 
 - Android Java 17 / Gradle / minSdk 26

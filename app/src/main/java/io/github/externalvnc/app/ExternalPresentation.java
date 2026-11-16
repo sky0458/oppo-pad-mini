@@ -6,6 +6,8 @@ import android.os.Bundle;
 import android.view.Display;
 import android.view.WindowManager;
 
+import java.util.function.Consumer;
+
 /** An independent Android window on the selected external Display. */
 public final class ExternalPresentation extends Presentation {
     private RemoteFrameView frameView;
@@ -26,6 +28,10 @@ public final class ExternalPresentation extends Presentation {
 
     public void showFrame(int w, int h, int[] pixels) {
         if (frameView != null) frameView.setFrame(w, h, pixels);
+    }
+
+    public void setDiagnosticListener(Consumer<String> callback) {
+        if (frameView != null) frameView.setDiagnosticListener(callback);
     }
 
     public void showMessage(String message) {

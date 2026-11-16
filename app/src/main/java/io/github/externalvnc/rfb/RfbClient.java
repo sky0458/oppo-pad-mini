@@ -43,6 +43,7 @@ public final class RfbClient implements AutoCloseable {
     private volatile int width, height, cursorX, cursorY;
     private volatile int buttonMask;
     private int[] pixels;
+    private int framebufferUpdates;
 
     public RfbClient(String host, int port, String username, String password,
                      AuthMode authMode, Listener listener) {
@@ -70,8 +71,10 @@ public final class RfbClient implements AutoCloseable {
                 int kind = in.readUnsignedByte();
                 switch (kind) {
                     case 0:
-                        readFramebufferUpdate(in);
-                        requestUpdate(true);
+                        // DesktopSize invalidates the local pixel buffer. Ask for a full
+                        // repaint rather than waiting for incremental damage that may never arrive.
+                        boolean needsFullRefresh = readFramebufferUpdate(in);
+                        requestUpdate(!needsFullRefresh);
                         break;
                     case 1: // SetColorMapEntries
                         in.readUnsignedByte();
@@ -213,6 +216,20 @@ public final class RfbClient implements AutoCloseable {
         }
     }
 
+    /** Manually request a full screen update if the server sent a blank/incomplete frame. */
+    public boolean requestFullRefresh() {
+        if (!active.get() || !ready.get()) return false;
+        try {
+            requestUpdate(false);
+            listener.onDiagnostic("Manual non-incremental framebuffer refresh requested");
+            return true;
+        } catch (IOException error) {
+            listener.onDiagnostic("Manual refresh failed: " + error.getMessage());
+            close();
+            return false;
+        }
+    }
+
     private void resize(int w, int h) throws IOException {
         if (w < 1 || h < 1 || (long) w * h > MAX_PIXELS)
             throw new IOException("Invalid framebuffer " + w + "x" + h);
@@ -221,20 +238,27 @@ public final class RfbClient implements AutoCloseable {
         cursorX = w / 2; cursorY = h / 2;
     }
 
-    private void readFramebufferUpdate(DataInputStream in) throws IOException {
+    /** Returns true when an updated desktop size requires a non-incremental repaint. */
+    private boolean readFramebufferUpdate(DataInputStream in) throws IOException {
         in.readUnsignedByte(); // pad
         int count = in.readUnsignedShort();
+        int rawRects = 0, copyRects = 0, resizeRects = 0;
+        long rawPixels = 0;
         for (int i = 0; i < count; i++) {
             int x = in.readUnsignedShort(), y = in.readUnsignedShort();
             int w = in.readUnsignedShort(), h = in.readUnsignedShort();
             int encoding = in.readInt();
             if (encoding == -223) { // DesktopSize: x/y must be zero
                 if (x != 0 || y != 0) throw new IOException("Invalid DesktopSize");
-                resize(w, h); continue;
+                resizeRects++;
+                if (w != width || h != height) resize(w, h);
+                continue;
             }
             if (w == 0 || h == 0 || x + w > width || y + h > height)
                 throw new IOException("Rectangle outside framebuffer");
             if (encoding == 0) {
+                rawRects++;
+                rawPixels += (long) w * h;
                 byte[] line = new byte[w * 4];
                 for (int row = 0; row < h; row++) {
                     in.readFully(line);
@@ -245,6 +269,7 @@ public final class RfbClient implements AutoCloseable {
                     }
                 }
             } else if (encoding == 1) {
+                copyRects++;
                 int sourceX = in.readUnsignedShort(), sourceY = in.readUnsignedShort();
                 if (sourceX + w > width || sourceY + h > height)
                     throw new IOException("CopyRect source outside framebuffer");
@@ -255,7 +280,13 @@ public final class RfbClient implements AutoCloseable {
                     System.arraycopy(tmp, row * w, pixels, (y + row) * width + x, w);
             } else throw new IOException("Unsupported framebuffer encoding " + encoding);
         }
-        if (count > 0) listener.onFrame(width, height, pixels);
+        framebufferUpdates++;
+        if (framebufferUpdates <= 8 || framebufferUpdates % 60 == 0 || resizeRects > 0)
+            listener.onDiagnostic("FramebufferUpdate #" + framebufferUpdates + " rects=" + count
+                    + " raw=" + rawRects + " copy=" + copyRects + " desktopSize=" + resizeRects
+                    + " rawPixels=" + rawPixels + " size=" + width + "x" + height);
+        if (rawRects > 0 || copyRects > 0) listener.onFrame(width, height, pixels);
+        return resizeRects > 0;
     }
 
     private static String readReason(DataInputStream in) throws IOException {

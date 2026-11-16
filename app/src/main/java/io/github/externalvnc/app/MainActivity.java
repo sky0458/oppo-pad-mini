@@ -37,6 +37,7 @@ import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import io.github.externalvnc.rfb.RfbClient;
 
@@ -46,10 +47,12 @@ import io.github.externalvnc.rfb.RfbClient;
  */
 public final class MainActivity extends Activity implements DisplayManager.DisplayListener {
     private static final int REQUEST_EXPORT_LOG = 1001;
+    private static final AtomicBoolean crashHandlerInstalled = new AtomicBoolean();
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicBoolean framePending = new AtomicBoolean();
     private final AtomicBoolean firstFrameLogged = new AtomicBoolean();
+    private final AtomicInteger receivedFrames = new AtomicInteger();
     private final List<Display> displays = new ArrayList<>();
 
     private DisplayManager displayManager;
@@ -71,6 +74,15 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     @Override public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         diagnostics = new AppLog(this);
+        if (crashHandlerInstalled.compareAndSet(false, true)) {
+            Thread.UncaughtExceptionHandler previous = Thread.getDefaultUncaughtExceptionHandler();
+            AppLog crashLog = diagnostics;
+            Thread.setDefaultUncaughtExceptionHandler((thread, error) -> {
+                crashLog.add("CRASH", "Uncaught on " + thread.getName() + ": "
+                        + android.util.Log.getStackTraceString(error));
+                if (previous != null) previous.uncaughtException(thread, error);
+            });
+        }
         diagnostics.add("APP", "Application started; logs are saved locally and credentials are never logged");
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         displayManager = (DisplayManager) getSystemService(DISPLAY_SERVICE);
@@ -137,6 +149,14 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
             scaleMode = (scaleMode + 1) % 3;
             scaleButton.setText(new String[]{"画面：适应", "画面：裁切", "画面：拉伸"}[scaleMode]);
             if (presentation != null) presentation.setScaleMode(scaleMode);
+        });
+
+        Button redrawButton = button(actionRow, "远端重绘", .8f);
+        redrawButton.setOnClickListener(v -> {
+            RfbClient client = currentClient;
+            if (client == null) status("请先连接 VNC 再请求重绘。");
+            else status(client.requestFullRefresh() ? "已向 Mac 请求完整画面更新。"
+                    : "VNC 尚未完成初始化，或连接已经断开。");
         });
 
         LinearLayout inputRow = row(layout);
@@ -326,6 +346,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         try {
             ExternalPresentation next = new ExternalPresentation(this, target);
             next.show();
+            next.setDiagnosticListener(message -> diagnostics.add("RENDER", message));
             next.setScaleMode(scaleMode);
             next.showMessage("Presentation OK · Display #" + target.getDisplayId());
             presentation = next;
@@ -412,6 +433,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
 
         final RfbClient[] holder = new RfbClient[1];
         firstFrameLogged.set(false);
+        receivedFrames.set(0);
         RfbClient session = new RfbClient(host, port, username, password, mode, new RfbClient.Listener() {
             @Override public void onConnected(String desktop, int width, int height) {
                 ui.post(() -> {
@@ -422,14 +444,36 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
             }
 
             @Override public void onFrame(int width, int height, int[] pixels) {
+                int number = receivedFrames.incrementAndGet();
+                if (number <= 3 || number % 60 == 0) {
+                    int samples = 0, nonBlack = 0, hasAlpha = 0;
+                    int step = Math.max(1, pixels.length / 1024);
+                    for (int i = 0; i < pixels.length; i += step) {
+                        samples++;
+                        if ((pixels[i] & 0x00ffffff) != 0) nonBlack++;
+                        if ((pixels[i] >>> 24) != 0) hasAlpha++;
+                    }
+                    diagnostics.add("FRAME", "Received #" + number + " " + width + "x" + height
+                            + ", nonBlack=" + nonBlack + "/" + samples
+                            + ", opaque=" + hasAlpha + "/" + samples
+                            + ", center=0x" + Integer.toHexString(pixels[pixels.length / 2]));
+                }
                 if (firstFrameLogged.compareAndSet(false, true))
                     diagnostics.add("FRAME", "First framebuffer update " + width + "x" + height);
                 if (!framePending.compareAndSet(false, true)) return;
                 int[] copy = Arrays.copyOf(pixels, pixels.length);
                 ui.post(() -> {
                     try {
-                        if (currentClient == holder[0] && presentation != null)
-                            presentation.showFrame(width, height, copy);
+                        if (currentClient == holder[0] && presentation != null) {
+                            try {
+                                presentation.showFrame(width, height, copy);
+                                if (number == 1)
+                                    status("已提交第一帧到 HDMI；请看显示器左上角的帧号标记。");
+                            } catch (RuntimeException exception) {
+                                diagnostics.add("RENDER", "Error applying frame: " + exception);
+                                status("VNC 已连接但画面绘制失败，请导出日志：" + exception.getMessage());
+                            }
+                        }
                     } finally {
                         framePending.set(false);
                     }

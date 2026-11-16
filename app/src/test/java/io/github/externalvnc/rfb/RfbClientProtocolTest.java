@@ -1,0 +1,137 @@
+package io.github.externalvnc.rfb;
+
+import org.junit.Test;
+
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.junit.Assert.*;
+
+/** End-to-end RFB protocol fixture without needing macOS or an Android device. */
+public class RfbClientProtocolTest {
+    @Test public void desktopSizeCausesFullRefreshAndRawPixelsReachListener() throws Exception {
+        ExecutorService threads = Executors.newFixedThreadPool(2);
+        try (ServerSocket server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
+            CountDownLatch nextUpdateRequested = new CountDownLatch(1);
+            Future<?> serverFuture = threads.submit(() -> {
+                try (Socket socket = server.accept()) {
+                    socket.setSoTimeout(10000);
+                    DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+                    DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+                    out.write("RFB 003.008\n".getBytes(StandardCharsets.US_ASCII));
+                    out.flush();
+                    byte[] version = new byte[12];
+                    in.readFully(version);
+                    assertEquals("RFB 003.008\n", new String(version, StandardCharsets.US_ASCII));
+
+                    out.writeByte(1); // one security type
+                    out.writeByte(1); // None
+                    out.flush();
+                    assertEquals(1, in.readUnsignedByte());
+                    out.writeInt(0); // SecurityResult success
+                    out.flush();
+                    assertEquals(1, in.readUnsignedByte()); // ClientInit shared
+
+                    out.writeShort(2); out.writeShort(2); // original dimensions
+                    out.write(new byte[16]); // pixel format (client requests its own)
+                    byte[] name = "mock-vnc".getBytes(StandardCharsets.UTF_8);
+                    out.writeInt(name.length);
+                    out.write(name);
+                    out.flush();
+
+                    byte[] pixelFormatRequest = new byte[20];
+                    in.readFully(pixelFormatRequest);
+                    assertEquals(0, pixelFormatRequest[0]);
+                    byte[] encodingRequest = new byte[16];
+                    in.readFully(encodingRequest);
+                    assertEquals(2, encodingRequest[0]);
+                    assertFalse(readUpdateRequestIncremental(in)); // initial full repaint
+
+                    // Server only advertises new dimensions. This must not be treated
+                    // as a complete frame, and the next request must be non-incremental.
+                    out.writeByte(0); out.writeByte(0); out.writeShort(1);
+                    writeRectangleHeader(out, 0, 0, 3, 2, -223);
+                    out.flush();
+                    assertFalse(readUpdateRequestIncremental(in));
+
+                    out.writeByte(0); out.writeByte(0); out.writeShort(1);
+                    writeRectangleHeader(out, 0, 0, 3, 2, 0);
+                    for (int i = 0; i < 6; i++) {
+                        out.writeByte(0x33 + i); // blue
+                        out.writeByte(0x22);     // green
+                        out.writeByte(0x11);     // red
+                        out.writeByte(0);        // padding
+                    }
+                    out.flush();
+                    assertTrue(readUpdateRequestIncremental(in)); // next frame can be incremental
+                    nextUpdateRequested.countDown();
+                    assertEquals(-1, in.read()); // wait until the client closes deliberately
+                    return null;
+                }
+            });
+
+            CountDownLatch frameReceived = new CountDownLatch(1);
+            AtomicReference<int[]> received = new AtomicReference<>();
+            AtomicReference<String> failure = new AtomicReference<>();
+            RfbClient client = new RfbClient("127.0.0.1", server.getLocalPort(), "", "",
+                    RfbClient.AuthMode.AUTO, new RfbClient.Listener() {
+                @Override public void onConnected(String desktop, int width, int height) {
+                    assertEquals("mock-vnc", desktop);
+                }
+                @Override public void onFrame(int width, int height, int[] pixels) {
+                    assertEquals(3, width);
+                    assertEquals(2, height);
+                    received.set(Arrays.copyOf(pixels, pixels.length));
+                    frameReceived.countDown();
+                }
+                @Override public void onError(String message) { failure.set(message); }
+                @Override public void onDisconnected() { }
+                @Override public void onDiagnostic(String message) { }
+            });
+            Future<?> clientFuture = threads.submit(client::runBlocking);
+            try {
+                assertTrue("RFB frame was not received", frameReceived.await(10, TimeUnit.SECONDS));
+                int[] image = received.get();
+                assertNotNull(image);
+                assertEquals(6, image.length);
+                assertEquals(0xff112233, image[0]);
+                assertEquals(0xff112238, image[5]);
+                assertTrue("Next framebuffer request was not observed",
+                        nextUpdateRequested.await(10, TimeUnit.SECONDS));
+            } finally {
+                client.close();
+                clientFuture.get(10, TimeUnit.SECONDS);
+            }
+            serverFuture.get(10, TimeUnit.SECONDS);
+            assertNull(failure.get());
+        } finally {
+            threads.shutdownNow();
+        }
+    }
+
+    private static void writeRectangleHeader(DataOutputStream out,
+                                             int x, int y, int width, int height, int encoding) throws Exception {
+        out.writeShort(x); out.writeShort(y); out.writeShort(width); out.writeShort(height);
+        out.writeInt(encoding);
+    }
+
+    private static boolean readUpdateRequestIncremental(DataInputStream in) throws Exception {
+        byte[] request = new byte[10];
+        in.readFully(request);
+        assertEquals(3, request[0]);
+        return request[1] != 0;
+    }
+}
