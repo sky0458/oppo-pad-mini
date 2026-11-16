@@ -6,6 +6,7 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import io.github.externalvnc.rfb.RfbClient;
 
 /** A touchpad on the Android primary display, sending RFB input to the remote computer. */
@@ -29,15 +30,28 @@ public final class TouchpadView extends View {
     private float lastX, lastY, startX, startY, wheel;
     private long downTime;
     private boolean moved;
+    private boolean twoFingerTap, twoFingerMoved, dragging;
+    private final int touchSlop;
+    private final Runnable beginDrag = () -> {
+        if (!moved && !twoFingerTap && client != null && !dragging) {
+            dragging = true;
+            client.setButtons(1);
+            performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS);
+        }
+    };
 
     public TouchpadView(Context context) {
         super(context);
         setFocusable(true);
         setFocusableInTouchMode(true);
         setBackgroundColor(Color.rgb(31, 43, 56));
+        touchSlop = ViewConfiguration.get(context).getScaledTouchSlop();
     }
 
-    public void setClient(RfbClient client) { this.client = client; }
+    public void setClient(RfbClient client) {
+        stopDrag();
+        this.client = client;
+    }
     public void setMouseSpeed(float mouseSpeed) { this.mouseSpeed = mouseSpeed; }
     public void setInputListener(InputListener listener) { inputListener = listener; }
     public void setCaptureListener(CaptureListener listener) { captureListener = listener; }
@@ -69,11 +83,18 @@ public final class TouchpadView extends View {
         if (inputListener != null) inputListener.onScroll(up);
     }
 
+    private void stopDrag() {
+        removeCallbacks(beginDrag);
+        if (dragging && client != null) client.setButtons(0);
+        dragging = false;
+    }
+
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
         paint.setColor(0xffc0d8e4);
         paint.setTextSize(18 * getResources().getDisplayMetrics().scaledDensity);
-        canvas.drawText("触控板：单指移动/点击 · 双指滚动", 24, getHeight() / 2f, paint);
+        canvas.drawText("触控板：移动/点击 · 双指右键/滚动 · 长按拖拽",
+                24, getHeight() / 2f, paint);
     }
 
     @Override public boolean onTouchEvent(MotionEvent event) {
@@ -87,22 +108,45 @@ public final class TouchpadView extends View {
                 downTime = event.getEventTime();
                 wheel = 0;
                 moved = false;
+                twoFingerTap = false;
+                twoFingerMoved = false;
+                stopDrag();
+                postDelayed(beginDrag, ViewConfiguration.getLongPressTimeout());
                 return true;
             case MotionEvent.ACTION_POINTER_DOWN:
+                removeCallbacks(beginDrag);
+                stopDrag();
+                if (event.getPointerCount() == 2) {
+                    twoFingerTap = true;
+                    twoFingerMoved = false;
+                    lastX = (event.getX(0) + event.getX(1)) / 2f;
+                    lastY = (event.getY(0) + event.getY(1)) / 2f;
+                } else twoFingerTap = false;
+                moved = true;
+                return true;
             case MotionEvent.ACTION_POINTER_UP:
                 moved = true;
-                lastX = event.getX(); lastY = event.getY();
+                int released = event.getActionIndex();
+                int remaining = released == 0 ? 1 : 0;
+                lastX = event.getX(remaining); lastY = event.getY(remaining);
                 return true;
             case MotionEvent.ACTION_MOVE:
-                float newX = event.getX(), newY = event.getY();
+                boolean multiple = event.getPointerCount() >= 2;
+                float newX = multiple ? (event.getX(0) + event.getX(1)) / 2f : event.getX();
+                float newY = multiple ? (event.getY(0) + event.getY(1)) / 2f : event.getY();
                 float dx = newX - lastX, dy = newY - lastY;
-                if (Math.hypot(newX - startX, newY - startY) > 12) moved = true;
+                if (!multiple && Math.hypot(newX - startX, newY - startY) > touchSlop) {
+                    moved = true;
+                    removeCallbacks(beginDrag);
+                }
                 if (client != null || inputListener != null) {
-                    if (event.getPointerCount() >= 2) {
+                    if (multiple) {
+                        if (Math.hypot(dx, dy) > touchSlop / 2f) twoFingerMoved = true;
                         wheel += dy;
                         while (Math.abs(wheel) >= 30) {
                             boolean up = wheel < 0;
                             emitScroll(up);
+                            twoFingerMoved = true;
                             wheel += up ? 30 : -30;
                         }
                     } else {
@@ -112,12 +156,17 @@ public final class TouchpadView extends View {
                 lastX = newX; lastY = newY;
                 return true;
             case MotionEvent.ACTION_UP:
-                if ((client != null || inputListener != null) && !moved
-                        && event.getEventTime() - downTime < 300)
-                    emitClick(1);
+                removeCallbacks(beginDrag);
+                if (dragging) stopDrag();
+                else if ((client != null || inputListener != null)
+                        && event.getEventTime() - downTime < 300) {
+                    if (twoFingerTap && !twoFingerMoved) emitClick(4);
+                    else if (!moved) emitClick(1);
+                }
                 getParent().requestDisallowInterceptTouchEvent(false);
                 return true;
             case MotionEvent.ACTION_CANCEL:
+                stopDrag();
                 getParent().requestDisallowInterceptTouchEvent(false);
                 return true;
             default: return true;

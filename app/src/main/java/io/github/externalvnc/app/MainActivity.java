@@ -5,7 +5,9 @@ import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
+import android.content.Context;
 import android.graphics.Color;
+import android.graphics.Insets;
 import android.hardware.display.DisplayManager;
 import android.net.Uri;
 import android.provider.Settings;
@@ -18,20 +20,26 @@ import android.view.Display;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.Gravity;
+import android.view.WindowInsets;
 import android.view.WindowManager;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.Spinner;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.widget.AdapterView;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.security.GeneralSecurityException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
@@ -77,8 +85,19 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
 
     private DisplayManager displayManager;
     private Spinner displaySelector;
+    private Spinner profileSelector;
     private Spinner authSelector;
-    private EditText hostField, portField, usernameField, passwordField;
+    private EditText hostField, portField, usernameField, passwordField, profileNameField;
+    private CheckBox savePasswordCheck;
+    private ProfileRepository profileRepository;
+    private CredentialVault credentialVault;
+    private List<ConnectionProfile> profileOptions = new ArrayList<>();
+    private String editingProfileId, activeSessionProfileId;
+    private boolean loadingProfile;
+    private boolean drawerOpen;
+    private FrameLayout drawerOverlay;
+    private ScrollView drawerPanel;
+    private Button floatingMenuButton;
     private AppLog diagnostics;
     private TextView statusLabel;
     private Button connectButton, scaleButton, captureButton;
@@ -115,13 +134,14 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
             });
         }
         diagnostics.add("APP", "Application started; logs are saved locally and credentials are never logged");
+        profileRepository = new ProfileRepository(this);
+        credentialVault = new CredentialVault(this);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         displayManager = (DisplayManager) getSystemService(DISPLAY_SERVICE);
         displayManager.registerDisplayListener(this, ui);
         buildInterface();
         refreshDisplays();
-        hostField.setText(getPreferences(MODE_PRIVATE).getString("host", ""));
-        portField.setText(getPreferences(MODE_PRIVATE).getString("port", "5900"));
+        refreshProfiles(profileRepository.defaultId());
         int savedFps = getPreferences(MODE_PRIVATE).getInt("targetFps", 30);
         targetFps = savedFps == 60 || savedFps == 90 ? savedFps : 30;
         fpsButton.setText("目标帧率：" + targetFps);
@@ -132,21 +152,90 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         touchpad.setMouseSpeed(mouseSpeed);
         captureButton.setText(immersiveMouse ? "沉浸鼠标：待抓取" : "抓取鼠标");
         VncKeyboardAccessibilityService.attach(this);
+        // A new launch has no active session: expose the connection controls first.
+        ui.post(this::openDrawer);
     }
 
     private void buildInterface() {
+        FrameLayout screen = new FrameLayout(this);
+        screen.setBackgroundColor(0xff1f2b38);
+        setContentView(screen);
+
+        touchpad = new TouchpadView(this);
+        screen.addView(touchpad, new FrameLayout.LayoutParams(-1, -1));
+
+        floatingMenuButton = new Button(this);
+        floatingMenuButton.setAllCaps(false);
+        floatingMenuButton.setText("☰");
+        floatingMenuButton.setTextSize(22);
+        floatingMenuButton.setContentDescription("打开远程控制菜单");
+        floatingMenuButton.setOnClickListener(v -> openDrawer());
+        FrameLayout.LayoutParams fabParams = new FrameLayout.LayoutParams(dp(58), dp(58),
+                Gravity.TOP | Gravity.END);
+        fabParams.topMargin = dp(28);
+        fabParams.rightMargin = dp(14);
+        screen.addView(floatingMenuButton, fabParams);
+
+        // The drawer is an in-app overlay, not a SYSTEM_ALERT_WINDOW system overlay.
+        drawerOverlay = new FrameLayout(this);
+        drawerOverlay.setBackgroundColor(0xb9000000);
+        drawerOverlay.setClickable(true);
+        drawerOverlay.setVisibility(View.GONE);
+        drawerOverlay.setOnClickListener(v -> closeDrawer());
+        screen.addView(drawerOverlay, new FrameLayout.LayoutParams(-1, -1));
+
+        ScrollView drawerScroll = new ScrollView(this);
+        drawerPanel = drawerScroll;
+        drawerScroll.setBackgroundColor(0xff18202d);
+        drawerScroll.setFillViewport(false);
+        drawerScroll.setClickable(true);
+        int drawerWidth = Math.min(dp(440),
+                Math.round(getResources().getDisplayMetrics().widthPixels * .83f));
+        FrameLayout.LayoutParams drawerParams = new FrameLayout.LayoutParams(drawerWidth,
+                -1, Gravity.RIGHT);
+        drawerOverlay.addView(drawerScroll, drawerParams);
+
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
-        layout.setPadding(dp(10), dp(8), dp(10), dp(8));
+        layout.setPadding(dp(12), dp(16), dp(12), dp(26));
         layout.setBackgroundColor(0xff18202d);
-        setContentView(layout);
+        drawerScroll.addView(layout, new ScrollView.LayoutParams(-1, -2));
 
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            screen.setOnApplyWindowInsetsListener((view, insets) -> {
+                Insets safe = insets.getInsets(WindowInsets.Type.displayCutout()
+                        | WindowInsets.Type.systemBars());
+                FrameLayout.LayoutParams position = (FrameLayout.LayoutParams)
+                        floatingMenuButton.getLayoutParams();
+                position.topMargin = Math.max(dp(14), safe.top + dp(10));
+                position.rightMargin = Math.max(dp(14), safe.right + dp(10));
+                floatingMenuButton.setLayoutParams(position);
+                return insets;
+            });
+        }
+
+        LinearLayout titleRow = row(layout);
         TextView heading = label("OPPO Pad Mini · 外屏 VNC", 19);
         heading.setTextColor(Color.WHITE);
-        layout.addView(heading);
+        titleRow.addView(heading, new LinearLayout.LayoutParams(0, -2, 1));
+        Button closeButton = button(titleRow, "关闭 ✕", .48f);
+        closeButton.setOnClickListener(v -> closeDrawer());
         statusLabel = label("连接 HDMI 后，先测试是否可独立显示。", 12);
         statusLabel.setTextColor(0xff93ebd1);
         layout.addView(statusLabel);
+
+        TextView connectionHeading = label("连接管理", 16);
+        connectionHeading.setTextColor(Color.WHITE);
+        layout.addView(connectionHeading);
+
+        LinearLayout profilesRow = row(layout);
+        profileSelector = new Spinner(this);
+        profilesRow.addView(profileSelector, new LinearLayout.LayoutParams(0, dp(48), 2.2f));
+        Button newProfileButton = button(profilesRow, "新增", .7f);
+        newProfileButton.setOnClickListener(v -> newProfile());
+        Button defaultProfileButton = button(profilesRow, "设默认", 1f);
+        defaultProfileButton.setOnClickListener(v -> markDefaultProfile());
+        profileNameField = textField(row(layout), "配置名称", "", InputType.TYPE_CLASS_TEXT, 1f);
 
         LinearLayout credentials = row(layout);
         hostField = textField(credentials, "Mac IP / ZeroTier IP", "", InputType.TYPE_CLASS_TEXT, 2.5f);
@@ -169,6 +258,17 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         authenticationOptions.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         authSelector.setAdapter(authenticationOptions);
         authRow.addView(authSelector, new LinearLayout.LayoutParams(0, dp(48), 1.4f));
+
+        LinearLayout profileActionRow = row(layout);
+        savePasswordCheck = new CheckBox(this);
+        savePasswordCheck.setText("加密保存密码");
+        savePasswordCheck.setTextColor(Color.WHITE);
+        savePasswordCheck.setChecked(true);
+        profileActionRow.addView(savePasswordCheck, new LinearLayout.LayoutParams(0, dp(48), 1.7f));
+        Button saveProfileButton = button(profileActionRow, "保存配置", 1f);
+        saveProfileButton.setOnClickListener(v -> saveProfile());
+        Button deleteProfileButton = button(profileActionRow, "删除", .75f);
+        deleteProfileButton.setOnClickListener(v -> confirmDeleteProfile());
 
         LinearLayout monitorRow = row(layout);
         displaySelector = new Spinner(this);
@@ -245,8 +345,8 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         accessibilityButton = button(inputRow, "无障碍键盘", 1.1f);
         accessibilityButton.setOnClickListener(v -> showAccessibilityInstructions());
 
-        TextView hint = label("默认沉浸鼠标：连接后尝试自动捕获实体鼠标，移动不受触控板边界限制。"
-                + "光标为 Mac 样式；『鼠标/画质』中可调大小、速度和传输画质。", 12);
+        TextView hint = label("菜单收起后整个 Pad 都是触控板：单指移动/点击、双指轻点右键、双指滚动、长按拖拽。"
+                + "默认尝试沉浸捕获实体鼠标，移动不受触控板边界限制；『鼠标/画质』中可调光标和速度。", 12);
         hint.setTextColor(0xffb9c6d4);
         layout.addView(hint);
 
@@ -258,7 +358,6 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         Button exportLogButton = button(logRow, "导出日志", 1f);
         exportLogButton.setOnClickListener(v -> requestExportLogs());
 
-        touchpad = new TouchpadView(this);
         touchpad.setInputListener(new TouchpadView.InputListener() {
             @Override public void onMove(float dx, float dy) {
                 if (inputTestPresentation != null) inputTestPresentation.move(dx, dy);
@@ -281,13 +380,18 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
             if (inputTestPresentation != null) {
                 inputTestPresentation.captured(hasCapture);
                 status(hasCapture ? "鼠标已捕获：移动鼠标，观察 HDMI 绿色虚拟光标。"
-                        : "鼠标未捕获：把鼠标移入下方触控板区域，也可验证输入。");
+                        : "鼠标未捕获：在 Pad 触控板区域仍可以测试移动。");
             }
         });
         touchpad.setOnCapturedPointerListener(this::handleCapturedPointer);
-        LinearLayout.LayoutParams touchParams = new LinearLayout.LayoutParams(-1, 0, 1);
-        touchParams.topMargin = dp(6);
-        layout.addView(touchpad, touchParams);
+        profileSelector.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view,
+                                                  int position, long id) {
+                if (loadingProfile || position < 0 || position >= profileOptions.size()) return;
+                selectProfile(profileOptions.get(position));
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) { }
+        });
     }
 
     private void showResolutionOptions() {
@@ -396,10 +500,11 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     }
 
     private void requestImmersiveCapture() {
-        if (!immersiveMouse || currentClient == null || touchpad == null || !hasWindowFocus()) return;
+        if (!immersiveMouse || drawerOpen || currentClient == null
+                || touchpad == null || !hasWindowFocus()) return;
         touchpad.requestFocus();
         touchpad.postDelayed(() -> {
-            if (immersiveMouse && currentClient != null && hasWindowFocus()
+            if (immersiveMouse && !drawerOpen && currentClient != null && hasWindowFocus()
                     && !touchpad.hasPointerCapture()) {
                 touchpad.requestPointerCapture();
                 diagnostics.add("INPUT", "Automatic immersive pointer capture requested");
@@ -408,7 +513,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
     }
 
     boolean forwardAccessibilityKey(KeyEvent event) {
-        if (currentClient == null || !hasWindowFocus() || touchpad == null
+        if (drawerOpen || currentClient == null || !hasWindowFocus() || touchpad == null
                 || getCurrentFocus() != touchpad) return false;
         int action = event.getAction();
         if (action != KeyEvent.ACTION_DOWN && action != KeyEvent.ACTION_UP) return false;
@@ -434,7 +539,32 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
 
     @Override public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
-        if (hasFocus) requestImmersiveCapture();
+        if (hasFocus) {
+            applyPadImmersive();
+            requestImmersiveCapture();
+        }
+    }
+
+    private void applyPadImmersive() {
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            android.view.WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller != null) {
+                controller.hide(WindowInsets.Type.systemBars());
+                controller.setSystemBarsBehavior(
+                        android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            }
+        } else {
+            getWindow().getDecorView().setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN);
+        }
+    }
+
+    @Override public void onBackPressed() {
+        if (drawerOpen) closeDrawer();
+        else openDrawer();
     }
 
     private void showCustomResolution() {
@@ -493,6 +623,179 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         label.setTextSize(sp);
         label.setPadding(dp(4), dp(3), dp(4), dp(3));
         return label;
+    }
+
+    private void openDrawer() {
+        if (drawerOpen) return;
+        drawerOpen = true;
+        if (touchpad != null && touchpad.hasPointerCapture()) touchpad.releasePointerCapture();
+        if (currentClient != null) {
+            currentClient.setButtons(0);
+            currentClient.releaseAllKeys();
+        }
+        if (drawerOverlay != null) drawerOverlay.setVisibility(View.VISIBLE);
+        if (drawerPanel != null) {
+            drawerPanel.animate().cancel();
+            drawerPanel.setTranslationX(drawerPanel.getLayoutParams().width);
+            drawerPanel.animate().translationX(0f).setDuration(200).start();
+        }
+    }
+
+    private void closeDrawer() {
+        if (!drawerOpen) return;
+        drawerOpen = false;
+        if (drawerPanel != null) {
+            drawerPanel.animate().cancel();
+            drawerPanel.animate().translationX(drawerPanel.getLayoutParams().width)
+                    .setDuration(180).withEndAction(() -> {
+                        if (!drawerOpen && drawerOverlay != null)
+                            drawerOverlay.setVisibility(View.GONE);
+                    }).start();
+        } else if (drawerOverlay != null) drawerOverlay.setVisibility(View.GONE);
+        InputMethodManager keyboard = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (keyboard != null) keyboard.hideSoftInputFromWindow(touchpad.getWindowToken(), 0);
+        if (touchpad != null) touchpad.requestFocus();
+        requestImmersiveCapture();
+    }
+
+    private void refreshProfiles(String selectedId) {
+        profileOptions = profileRepository.list();
+        List<String> labels = new ArrayList<>();
+        for (ConnectionProfile profile : profileOptions) {
+            String prefix = profile.id.equals(profileRepository.defaultId()) ? "★ " : "";
+            labels.add(prefix + profile.displayLabel());
+        }
+        if (labels.isEmpty()) labels.add("尚无连接配置，请点新增");
+        loadingProfile = true;
+        ArrayAdapter<String> adapter = new ArrayAdapter<String>(this,
+                android.R.layout.simple_spinner_item, labels) {
+            @Override public View getView(int position, View convertView,
+                                          android.view.ViewGroup parent) {
+                TextView view = (TextView) super.getView(position, convertView, parent);
+                view.setTextColor(Color.WHITE);
+                return view;
+            }
+        };
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        profileSelector.setAdapter(adapter);
+        int selected = 0;
+        for (int i = 0; i < profileOptions.size(); i++) {
+            if (profileOptions.get(i).id.equals(selectedId)) { selected = i; break; }
+        }
+        if (!profileOptions.isEmpty()) {
+            profileSelector.setSelection(selected);
+            loadProfile(profileOptions.get(selected));
+        } else newProfile();
+        loadingProfile = false;
+    }
+
+    private void selectProfile(ConnectionProfile selected) {
+        if (selected.id.equals(editingProfileId)) return;
+        if (currentClient != null && activeSessionProfileId != null
+                && !activeSessionProfileId.equals(selected.id)) {
+            String previousId = activeSessionProfileId;
+            new AlertDialog.Builder(this).setTitle("切换远程账号")
+                    .setMessage("切换账号需要先断开当前 VNC 会话，继续吗？")
+                    .setPositiveButton("断开并切换", (dialog, which) -> {
+                        disconnect();
+                        loadProfile(selected);
+                    })
+                    .setNegativeButton("取消", (dialog, which) ->
+                            refreshProfiles(previousId))
+                    .show();
+        } else loadProfile(selected);
+    }
+
+    private void loadProfile(ConnectionProfile profile) {
+        editingProfileId = profile.id;
+        profileNameField.setText(profile.name);
+        hostField.setText(profile.host);
+        portField.setText(Integer.toString(profile.port));
+        usernameField.setText(profile.username);
+        passwordField.setText("");
+        boolean saved = credentialVault.hasSavedPassword(profile.id);
+        passwordField.setHint(saved ? "已安全保存密码，留空沿用" : "密码（首次请输入）");
+        savePasswordCheck.setChecked(true);
+        authSelector.setSelection(profile.authMode.ordinal());
+    }
+
+    private void newProfile() {
+        editingProfileId = null;
+        profileNameField.setText("新连接");
+        hostField.setText("");
+        portField.setText("5900");
+        usernameField.setText("");
+        passwordField.setText("");
+        passwordField.setHint("密码（可选择保存）");
+        savePasswordCheck.setChecked(true);
+        authSelector.setSelection(0);
+        status("新建连接配置：填写账号并点击『保存配置』。 ");
+    }
+
+    private boolean saveProfile() {
+        String host = hostField.getText().toString().trim();
+        String name = profileNameField.getText().toString().trim();
+        String username = usernameField.getText().toString().trim();
+        String portString = portField.getText().toString().trim();
+        if (host.isEmpty() || host.length() > 253 || username.length() > 256 || name.length() > 100) {
+            status("保存失败：请填写合法主机地址、配置名称和用户名。");
+            return false;
+        }
+        final int port;
+        try {
+            port = Integer.parseInt(portString);
+            if (port < 1 || port > 65535) throw new NumberFormatException();
+        } catch (NumberFormatException error) {
+            status("保存失败：端口必须为 1–65535。");
+            return false;
+        }
+        ConnectionProfile profile = editingProfileId == null ? null
+                : profileRepository.find(editingProfileId);
+        if (profile == null) profile = new ConnectionProfile();
+        profile.name = name.isEmpty() ? "Mac 连接" : name;
+        profile.host = host;
+        profile.port = port;
+        profile.username = username;
+        profile.authMode = RfbClient.AuthMode.values()[authSelector.getSelectedItemPosition()];
+        String enteredPassword = passwordField.getText().toString();
+        try {
+            profileRepository.upsert(profile);
+            if (!savePasswordCheck.isChecked()) credentialVault.remove(profile.id);
+            else if (!enteredPassword.isEmpty()) credentialVault.save(profile.id, enteredPassword);
+            editingProfileId = profile.id;
+            passwordField.setText("");
+            refreshProfiles(profile.id);
+            status("连接配置已保存" + (credentialVault.hasSavedPassword(profile.id)
+                    ? "（密码使用设备 Keystore 加密）" : "（未保存密码）"));
+            return true;
+        } catch (RuntimeException | GeneralSecurityException error) {
+            status("保存连接配置失败：" + error.getClass().getSimpleName());
+            return false;
+        }
+    }
+
+    private void markDefaultProfile() {
+        if (editingProfileId == null) {
+            status("请先保存连接配置，再设置默认账号。");
+            return;
+        }
+        profileRepository.makeDefault(editingProfileId);
+        refreshProfiles(editingProfileId);
+        status("已设置为默认连接账号。");
+    }
+
+    private void confirmDeleteProfile() {
+        if (editingProfileId == null) return;
+        String removing = editingProfileId;
+        new AlertDialog.Builder(this).setTitle("删除连接账号")
+                .setMessage("将删除此连接配置和设备上加密保存的密码，无法撤销。")
+                .setPositiveButton("删除", (dialog, which) -> {
+                    if (removing.equals(activeSessionProfileId)) disconnect();
+                    credentialVault.remove(removing);
+                    profileRepository.remove(removing);
+                    refreshProfiles(profileRepository.defaultId());
+                    status("连接账号及关联密码已删除。");
+                }).setNegativeButton("取消", null).show();
     }
 
     private LinearLayout row(LinearLayout parent) {
@@ -673,23 +976,22 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
 
     private void connect() {
         if (!openPresentation()) return;
-        String host = hostField.getText().toString().trim();
-        String portString = portField.getText().toString().trim();
-        String username = usernameField.getText().toString().trim();
-        String password = passwordField.getText().toString();
-        if (host.isEmpty()) { status("请填写 Mac 的局域网 IP。"); return; }
-        final int port;
+        String typedPassword = passwordField.getText().toString();
+        if (!saveProfile()) return;
+        ConnectionProfile profile = profileRepository.find(editingProfileId);
+        if (profile == null) { status("请选择有效连接账号。"); return; }
+        String host = profile.host, username = profile.username;
+        int port = profile.port;
+        final String password;
         try {
-            port = Integer.parseInt(portString);
-            if (port < 1 || port > 65535) throw new NumberFormatException();
-        } catch (NumberFormatException error) {
-            status("端口应在 1–65535 之间，通常为 5900。");
+            String stored = typedPassword.isEmpty() ? credentialVault.load(profile.id) : typedPassword;
+            password = stored == null ? "" : stored;
+        } catch (GeneralSecurityException error) {
+            status("保存的密码无法解密，请重新输入并保存。" );
             return;
         }
 
-        RfbClient.AuthMode mode = new RfbClient.AuthMode[]{RfbClient.AuthMode.AUTO,
-                RfbClient.AuthMode.MAC_ACCOUNT, RfbClient.AuthMode.MAC_CBC_COMPAT,
-                RfbClient.AuthMode.VNC_PASSWORD}[authSelector.getSelectedItemPosition()];
+        RfbClient.AuthMode mode = profile.authMode;
         if ((mode == RfbClient.AuthMode.MAC_ACCOUNT || mode == RfbClient.AuthMode.MAC_CBC_COMPAT)
                 && username.isEmpty()) {
             status("Mac 账号认证请填写本地用户名（不是 Apple ID 邮箱）。");
@@ -699,11 +1001,9 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
             status("请填写密码；Mac 账号认证使用 Mac 登录密码。");
             return;
         }
-        // Password intentionally never persisted.
-        getPreferences(MODE_PRIVATE).edit()
-                .putString("host", host)
-                .putString("port", portString)
-                .apply();
+        // Legacy host/port metadata only. Password is kept in Keystore-backed storage.
+        getPreferences(MODE_PRIVATE).edit().putString("host", host)
+                .putString("port", Integer.toString(port)).apply();
 
         diagnostics.add("CONNECT", "Starting VNC connection port=" + port
                 + " auth=" + mode + " usernameProvided=" + !username.isEmpty()
@@ -723,6 +1023,11 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
             @Override public void onConnected(String desktop, int width, int height) {
                 ui.post(() -> {
                     if (currentClient != holder[0]) return;
+                    ConnectionProfile savedProfile = profileRepository.find(profile.id);
+                    if (savedProfile != null) {
+                        savedProfile.lastConnectedAt = System.currentTimeMillis();
+                        profileRepository.upsert(savedProfile);
+                    }
                     status("已连接 " + desktop + " · " + width + "×" + height);
                     touchpad.requestFocus();
                     if (immersiveMouse) requestImmersiveCapture();
@@ -815,6 +1120,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                     if (currentClient != holder[0]) return;
                     synchronized (renderLock) { renderUpdates.clear(); }
                     currentClient = null;
+                    activeSessionProfileId = null;
                     touchpad.setClient(null);
                     fpsStatus.setText("实际：-- FPS");
                     connectButton.setText("连接 VNC");
@@ -828,12 +1134,14 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
 
         holder[0] = session;
         currentClient = session;
+        activeSessionProfileId = profile.id;
         session.setTargetFps(targetFps);
         session.setFastColor(fastColor);
         touchpad.setClient(session);
         touchpad.setMouseSpeed(mouseSpeed);
         connectButton.setText("断开 VNC");
         status("正在连接 " + host + ":" + port + " ...");
+        closeDrawer();
         worker.submit(session::runBlocking);
     }
 
@@ -881,6 +1189,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
         diagnostics.add("CONNECT", "Disconnect requested by app");
         RfbClient session = currentClient;
         currentClient = null;
+        activeSessionProfileId = null;
         if (session != null) session.close();
         touchpad.setClient(null);
         synchronized (renderLock) { renderUpdates.clear(); }
@@ -979,7 +1288,7 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
             return true;
         }
         RfbClient session = currentClient;
-        if (session != null && getCurrentFocus() == touchpad) {
+        if (!drawerOpen && session != null && getCurrentFocus() == touchpad) {
             int keysym = KeySyms.map(event);
             if (keysym != 0 && (event.getAction() == KeyEvent.ACTION_DOWN
                     || event.getAction() == KeyEvent.ACTION_UP)) {
