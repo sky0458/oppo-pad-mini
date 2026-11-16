@@ -403,7 +403,8 @@ public final class RfbClient implements AutoCloseable {
             if (encoding == -308) { // ExtendedDesktopSize; x=reason, y=status
                 int screens = in.readUnsignedByte();
                 skip(in, 3);
-                if (screens < 1 || screens > 16) throw new IOException("Invalid remote screen count");
+                if (screens > 16 || (screens == 0 && y == 0))
+                    throw new IOException("Invalid remote screen count");
                 for (int screen = 0; screen < screens; screen++) {
                     int id = in.readInt();
                     skip(in, 12); // x/y/width/height/flags

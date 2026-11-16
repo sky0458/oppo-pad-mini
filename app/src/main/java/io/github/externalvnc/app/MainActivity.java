@@ -641,8 +641,10 @@ public final class MainActivity extends Activity implements DisplayManager.Displ
                 diagnostics.add("CONNECT", "RFB session ended");
                 ui.post(() -> {
                     if (currentClient != holder[0]) return;
+                    synchronized (renderLock) { renderUpdates.clear(); }
                     currentClient = null;
                     touchpad.setClient(null);
+                    fpsStatus.setText("实际：-- FPS");
                     connectButton.setText("连接 VNC");
                 });
             }

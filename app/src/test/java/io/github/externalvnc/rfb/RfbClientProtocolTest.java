@@ -27,6 +27,7 @@ public class RfbClientProtocolTest {
         ExecutorService threads = Executors.newFixedThreadPool(2);
         try (ServerSocket server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
             CountDownLatch capability = new CountDownLatch(1);
+            CountDownLatch updateSeen = new CountDownLatch(1);
             CountDownLatch resizeSeen = new CountDownLatch(1);
             Future<?> serverFuture = threads.submit(() -> {
                 try (Socket socket = server.accept()) {
@@ -51,7 +52,10 @@ public class RfbClientProtocolTest {
                     out.writeInt(23); // server screen ID
                     out.writeShort(0); out.writeShort(0); out.writeShort(4); out.writeShort(4);
                     out.writeInt(0); out.flush();
-                    assertTrue(readUpdateRequestIncremental(in));
+                    // A server's ExtendedDesktopSize announcement may trigger either
+                    // an incremental request or a full repaint, depending on state.
+                    readUpdateRequestIncremental(in);
+                    updateSeen.countDown();
 
                     assertEquals(251, in.readUnsignedByte());
                     assertEquals(0, in.readUnsignedByte());
@@ -88,6 +92,7 @@ public class RfbClientProtocolTest {
                 assertFalse(client.supportsRemoteResize());
                 assertFalse(client.requestDesktopResize(1920, 1080));
                 assertTrue(capability.await(10, TimeUnit.SECONDS));
+                assertTrue(updateSeen.await(10, TimeUnit.SECONDS));
                 assertTrue(client.supportsRemoteResize());
                 assertTrue(client.requestDesktopResize(1920, 1080));
                 assertTrue(resizeSeen.await(10, TimeUnit.SECONDS));
